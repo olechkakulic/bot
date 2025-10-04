@@ -681,7 +681,7 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
     return json.dumps(kb, ensure_ascii=False)
 
 
-def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 6):
+def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 15):
     """Клавиатура списка выплат для конкретного пользователя с учетом его статусов."""
     total = len(user_payments_list)
     start = page * page_size
@@ -1138,12 +1138,143 @@ def get_payments_for_user(user_id: int):
         return user_payments.get(user_id, []).copy()  # Возвращаем копию для безопасности
 
 
+def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
+    """Загружает ВСЕ ведомости пользователя из базы данных, не только те что в памяти.
+    Возвращает список в том же формате что и get_payments_for_user."""
+    if not os.path.exists(DB_PATH):
+        log.warning("DB file not found: %s", DB_PATH)
+        return []
+    
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        # Получаем все ведомости пользователя, отсортированные по времени создания (новые сначала)
+        c.execute("""
+            SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+            FROM vedomosti_users 
+            WHERE vk_id = ? AND state LIKE 'imported:%'
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+        """, (str(user_id), limit))
+        rows = c.fetchall()
+        conn.close()
+        
+        payments = []
+        for db_row in rows:
+            try:
+                db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db, created_at_db = db_row
+                
+                if not state or not state.startswith('imported:'):
+                    continue
+                
+                parts = state.split(':', 1)
+                if len(parts) != 2 or not parts[1]:
+                    continue
+                
+                payment_id = parts[1]
+                
+                # Сначала проверяем, есть ли эта ведомость в памяти (более свежие данные)
+                memory_payment = None
+                with user_payments_lock:
+                    for p in user_payments.get(user_id, []):
+                        if p["id"] == payment_id:
+                            memory_payment = p
+                            break
+                
+                if memory_payment:
+                    # Используем данные из памяти (более актуальные)
+                    payments.append(memory_payment)
+                else:
+                    # Загружаем из CSV файла
+                    row_dict = {}
+                    if personal_path and os.path.exists(personal_path):
+                        try:
+                            df = get_cached_csv_data(personal_path)
+                            if isinstance(df, pd.DataFrame) and not df.empty:
+                                row_dict = df.iloc[0].to_dict()
+                        except Exception:
+                            log.warning("Failed to read CSV for payment %s path=%s", payment_id, personal_path)
+                    
+                    payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+                    
+                    entry = {
+                        "id": payment_id,
+                        "data": payment_data,
+                        "created_at": float(created_at_db) if created_at_db else time.time(),
+                        "status": status_db or "new",
+                    }
+                    
+                    if disagree_reason_db:
+                        entry["disagree_reason"] = disagree_reason_db
+                        
+                    payments.append(entry)
+                    
+            except Exception:
+                log.exception("Error loading payment from DB row %s", db_row)
+        
+        log.info("Loaded %d total payments for user %s from DB (limit=%d)", len(payments), user_id, limit)
+        return payments
+        
+    except Exception:
+        log.exception("Failed to load all payments for user %s from DB", user_id)
+        return []
+
+
 def find_payment(user_id: int, payment_id: str):
+    # Сначала ищем в памяти (быстрее и актуальнее)
     with user_payments_lock:
         for p in user_payments.get(user_id, []):
             if p["id"] == payment_id:
                 return p
-    return None
+    
+    # Если не нашли в памяти, ищем в базе данных
+    try:
+        if not os.path.exists(DB_PATH):
+            return None
+            
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+            FROM vedomosti_users 
+            WHERE vk_id = ? AND state = ?
+        """, (str(user_id), f"imported:{payment_id}"))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+            
+        db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db, created_at_db = row
+        
+        # Загружаем данные из CSV файла
+        row_dict = {}
+        if personal_path and os.path.exists(personal_path):
+            try:
+                df = get_cached_csv_data(personal_path)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    row_dict = df.iloc[0].to_dict()
+            except Exception:
+                log.warning("Failed to read CSV for find_payment %s path=%s", payment_id, personal_path)
+        
+        payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+        
+        entry = {
+            "id": payment_id,
+            "data": payment_data,
+            "created_at": float(created_at_db) if created_at_db else time.time(),
+            "status": status_db or "new",
+        }
+        
+        if disagree_reason_db:
+            entry["disagree_reason"] = disagree_reason_db
+            
+        log.info("Found payment %s for user %s in DB", payment_id, user_id)
+        return entry
+        
+    except Exception:
+        log.exception("Failed to find payment %s for user %s in DB", payment_id, user_id)
+        return None
 
 def send_payment_message(user_id: int, payment_entry: dict):
     """Отправляет сообщение с текстом выплаты и inline-кнопками."""
@@ -1376,7 +1507,7 @@ def handle_message_event(event):
             else:
                 safe_vk_send(user_id, "Ведомость не найдена (возможно устарела).")
         elif cmd == "to_list":
-            payments = get_payments_for_user(user_id)
+            payments = get_all_payments_for_user_from_db(user_id)
             if not payments:
                 safe_vk_send(user_id, "У вас нет выплат.", chat_bottom_keyboard())
                 return
@@ -1385,7 +1516,7 @@ def handle_message_event(event):
             return
         elif cmd == "payments_page":
             page = int(payload.get("page", 0))
-            payments = get_payments_for_user(user_id)
+            payments = get_all_payments_for_user_from_db(user_id)
             if not payments:
                 safe_vk_send(user_id, "У вас нет выплат.")
                 return
@@ -1594,7 +1725,7 @@ def handle_message_new(event):
                     )
                 return
             if cmd == "to_list":
-                payments = get_payments_for_user(from_id)
+                payments = get_all_payments_for_user_from_db(from_id)
                 if not payments:
                     vk.messages.send(
                         user_id=from_id,
@@ -1617,7 +1748,7 @@ def handle_message_new(event):
                 return
             if cmd == "payments_page":
                 page = int(payload.get("page", 0))
-                payments = get_payments_for_user(from_id)
+                payments = get_all_payments_for_user_from_db(from_id)
                 if not payments:
                     vk.messages.send(user_id=from_id, random_id=vk_api.utils.get_random_id(), message="У вас нет выплат.")
                     return
@@ -1683,7 +1814,7 @@ def handle_message_new(event):
                     )
                 return
         if text.lower() == "к списку выплат" or text == "К списку выплат":
-            payments = get_payments_for_user(from_id)
+            payments = get_all_payments_for_user_from_db(from_id)
             if not payments:
                 vk.messages.send(
                     user_id=from_id,
@@ -1707,7 +1838,7 @@ def handle_message_new(event):
         m = re.match(r"^\s*Ведомость\s+(\d+)\s*$", text, flags=re.IGNORECASE)
         if m:
             idx = int(m.group(1)) - 1
-            payments = get_payments_for_user(from_id)
+            payments = get_all_payments_for_user_from_db(from_id)
             if 0 <= idx < len(payments):
                 p = payments[idx]
                 log.info("User %s trying to open statement %s by text with status: %s", from_id, p["id"], p.get("status"))
