@@ -436,9 +436,10 @@ def background_importer(poll_interval=5.0):
     
     while True:
         try:
-            imported = import_vedomosti_into_memory()
+            # Import new reports and send notifications immediately to VK users
+            imported = import_vedomosti_into_memory(send_immediately=True)
             if imported:
-                log.info("Imported %d vedomosti into in-memory payments", imported)
+                log.info("Imported %d vedomosti into in-memory payments and sent VK notifications", imported)
             cleanup_archived_payments()
             current_time = time.time()
             if current_time - last_cleanup > MEMORY_CLEANUP_INTERVAL:
