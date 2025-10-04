@@ -14,6 +14,7 @@ import threading
 import sqlite3
 import random
 import string
+import uuid
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -380,17 +381,19 @@ def import_users_from_csv(dest_path: str, original_filename: str):
             c = conn.cursor()
             now = int(time.time())
             archive_time = now + (36 * 3600)  # 36 часов в секундах
-            
-            # Создаем уникальный state для этой ведомости
-            state_prefix = f"imported:{os.path.basename(original_filename)}"
-            
+
+            # Для КАЖДОЙ строки создаём уникальный идентификатор состояния, чтобы не
+            # было одного общего payment_id для всех пользователей одной ведомости.
             for vk_str, personal_path, original_filename in db_operations:
-                c.execute('INSERT INTO vedomosti_users(vk_id, personal_path, original_filename, state, created_at, archive_at) VALUES (?,?,?,?,?,?)',
-                          (str(vk_str), personal_path, original_filename, state_prefix, now, archive_time))
-            
+                unique_state = f"imported:{uuid.uuid4()}"
+                c.execute(
+                    'INSERT INTO vedomosti_users(vk_id, personal_path, original_filename, state, created_at, archive_at) VALUES (?,?,?,?,?,?)',
+                    (str(vk_str), personal_path, original_filename, unique_state, now, archive_time)
+                )
+
             conn.commit()
             conn.close()
-            log.info('Bulk inserted %d vedomosti users to database', len(db_operations))
+            log.info('Bulk inserted %d vedomosti users to database with unique states', len(db_operations))
         except Exception:
             log.exception('Failed to bulk insert vedomosti users')
 
