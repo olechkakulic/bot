@@ -247,6 +247,47 @@ def ensure_vedomosti_status_columns():
         log.exception("Failed to ensure vedomosti status columns")
 
 
+def ensure_unique_import_states():
+    """Миграция: заменяет общие состояния вида 'imported:<suffix>' на уникальные UUID.
+    Если суффикс не является UUID (например, это имя файла), генерируем новый UUID на КАЖДУЮ запись.
+    Это предотвращает ситуацию, когда одно состояние разделяется несколькими пользователями.
+    """
+    try:
+        if not os.path.exists(DB_PATH):
+            return
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("SELECT id, state FROM vedomosti_users WHERE state LIKE 'imported:%'")
+        rows = c.fetchall()
+        updated = 0
+        for db_id, state_val in rows:
+            try:
+                if not state_val:
+                    continue
+                parts = str(state_val).split(':', 1)
+                if len(parts) != 2:
+                    continue
+                suffix = parts[1]
+                try:
+                    uuid.UUID(str(suffix))
+                    is_uuid = True
+                except Exception:
+                    is_uuid = False
+                if not is_uuid:
+                    new_state = f"imported:{uuid.uuid4()}"
+                    c.execute("UPDATE vedomosti_users SET state = ? WHERE id = ?", (new_state, db_id))
+                    updated += 1
+            except Exception:
+                log.debug("Failed to migrate state for id=%s", db_id, exc_info=True)
+        if updated:
+            conn.commit()
+            log.info("Migrated %d vedomosti states to unique UUID-based values", updated)
+        conn.close()
+    except Exception:
+        log.exception("Failed to ensure unique import states")
+
+
 def update_vedomosti_status_by_payment(payment_id: str, status: str, reason: str = None):
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -610,24 +651,52 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
     page_items = statements[start:end]
     rows = []
     for sid, label in page_items:
-        # Проверяем статус выплаты для определения цвета и текста
-        payment_status = None
-        for user_id, payments in user_payments.items():
-            for payment in payments:
-                if payment["id"] == sid:
-                    payment_status = payment.get("status")
-                    break
-            if payment_status:
-                break
-        
-        # Определяем цвет и текст кнопки
-        if payment_status == "agreed":
+        # Не вычисляем статус по всем пользователям — это может привести к некорректной маркировке.
+        button_color = "primary"
+        button_label = label
+        rows.append([
+            {
+                "action": {
+                    "type": "text",
+                    "payload": json.dumps({"cmd": "open_statement", "statement_id": sid}, ensure_ascii=False),
+                    "label": button_label
+                },
+                "color": button_color
+            }
+        ])
+    if end < total:
+        next_page = page + 1
+        rows.append([
+            {
+                "action": {
+                    "type": "text",
+                    "payload": json.dumps({"cmd": "payments_page", "page": next_page}, ensure_ascii=False),
+                    "label": "Ещё"
+                },
+                "color": "secondary"
+            }
+        ])
+    kb = {"inline": True, "buttons": rows}
+    return json.dumps(kb, ensure_ascii=False)
+
+
+def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 6):
+    """Клавиатура списка выплат для конкретного пользователя с учетом его статусов."""
+    total = len(user_payments_list)
+    start = page * page_size
+    end = start + page_size
+    page_items = user_payments_list[start:end]
+    rows = []
+    for idx, entry in enumerate(page_items, start=1 + start):
+        sid = entry.get("id")
+        label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx)
+        status = entry.get("status")
+        if status == "agreed":
             button_color = "positive"
             button_label = f"{label} (Согласовано)"
         else:
             button_color = "primary"
             button_label = label
-            
         rows.append([
             {
                 "action": {
@@ -1310,12 +1379,8 @@ def handle_message_event(event):
             if not payments:
                 safe_vk_send(user_id, "У вас нет выплат.", chat_bottom_keyboard())
                 return
-            statements = []
-            for idx, p in enumerate(payments, start=1):
-                label = _format_payment_label(p["data"].get('original_filename'), idx)
-                statements.append((p["id"], label))
-            safe_vk_send(user_id, "Список ведомостей (выберите):", payments_list_keyboard(statements, page=0))
-            log.info("Sent payments list to %s: %s", user_id, [s[1] for s in statements])
+            safe_vk_send(user_id, "Список ведомостей (выберите):", payments_list_keyboard_for_user(payments, page=0))
+            log.info("Sent payments list to %s", user_id)
             return
         elif cmd == "payments_page":
             page = int(payload.get("page", 0))
@@ -1323,11 +1388,7 @@ def handle_message_event(event):
             if not payments:
                 safe_vk_send(user_id, "У вас нет выплат.")
                 return
-            statements = []
-            for idx, p in enumerate(payments, start=1):
-                label = _format_payment_label(p["data"].get('original_filename'), idx)
-                statements.append((p["id"], label))
-            safe_vk_send(user_id, f"Список ведомостей (страница {page+1}):", payments_list_keyboard(statements, page=page))
+            safe_vk_send(user_id, f"Список ведомостей (страница {page+1}):", payments_list_keyboard_for_user(payments, page=page))
             return
         else:
             safe_vk_send(user_id, f"Нажата inline-кнопка. Payload: {json.dumps(payload, ensure_ascii=False)}")
@@ -1549,9 +1610,9 @@ def handle_message_new(event):
                     user_id=from_id,
                     random_id=vk_api.utils.get_random_id(),
                     message="Список ведомостей (выберите):",
-                    keyboard=payments_list_keyboard(statements, page=0)
+                    keyboard=payments_list_keyboard_for_user(payments, page=0)
                 )
-                log.info("Sent payments list to %s: %s", from_id, [s[1] for s in statements])
+                log.info("Sent payments list to %s", from_id)
                 return
             if cmd == "payments_page":
                 page = int(payload.get("page", 0))
@@ -1567,7 +1628,7 @@ def handle_message_new(event):
                     user_id=from_id,
                     random_id=vk_api.utils.get_random_id(),
                     message="Список ведомостей (страница {}):".format(page+1),
-                    keyboard=payments_list_keyboard(statements, page=page)
+                    keyboard=payments_list_keyboard_for_user(payments, page=page)
                 )
                 return
             if cmd == "agree_verify":
@@ -1638,9 +1699,9 @@ def handle_message_new(event):
                 user_id=from_id,
                 random_id=vk_api.utils.get_random_id(),
                 message="Список ведомостей (выберите):",
-                keyboard=payments_list_keyboard(statements, page=0)
+                keyboard=payments_list_keyboard_for_user(payments, page=0)
             )
-            log.info("Sent payments list to %s: %s", from_id, [s[1] for s in statements])
+            log.info("Sent payments list to %s", from_id)
             return
         m = re.match(r"^\s*Ведомость\s+(\d+)\s*$", text, flags=re.IGNORECASE)
         if m:
@@ -1685,6 +1746,7 @@ def handle_message_new(event):
 def main_loop():
     log.info("Бот запущен. Ожидание событий...")
     ensure_vedomosti_status_columns()
+    ensure_unique_import_states()
     ensure_db_indexes()  # Создаем индексы для оптимизации
     try:
         loaded = load_imported_vedomosti_into_memory(send_notifications=False)
