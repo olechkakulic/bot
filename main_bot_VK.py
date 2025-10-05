@@ -292,10 +292,51 @@ def update_vedomosti_status_by_payment(payment_id: str, status: str, reason: str
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        state_val = f"imported:{payment_id}"
         now = int(time.time())
+        
+        # Обрабатываем новый формат unique_payment_id (original_payment_id_db_id)
+        if '_' in payment_id:
+            try:
+                db_id = int(payment_id.split('_')[-1])
+                # Ищем по db_id (более точно)
+                c.execute("SELECT id, vk_id, original_filename, state FROM vedomosti_users WHERE id = ?", (db_id,))
+                existing_record = c.fetchone()
+                
+                if existing_record:
+                    log.info("Found record by db_id for payment_id=%s: db_id=%s vk_id=%s filename=%s state=%s", 
+                            payment_id, existing_record[0], existing_record[1], existing_record[2], existing_record[3])
+                    
+                    # Обновляем по db_id
+                    if reason is not None:
+                        c.execute(
+                            "UPDATE vedomosti_users SET status = ?, disagree_reason = ?, confirmed_at = ? WHERE id = ?",
+                            (status, str(reason), now, db_id)
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE vedomosti_users SET status = ?, confirmed_at = ? WHERE id = ?",
+                            (status, now, db_id)
+                        )
+                    conn.commit()
+                    affected = c.rowcount
+                    conn.close()
+                    log.info("Updated vedomosti_users by db_id for payment=%s -> status=%s reason=%s affected=%s", payment_id, status, reason, affected)
+                    
+                    # Обновляем и в памяти
+                    update_payment_in_memory(payment_id, status, reason)
+                    return
+                    
+            except (ValueError, IndexError):
+                # Если не удалось извлечь db_id, используем старый способ
+                pass
+        
+        # Старый способ поиска по state (fallback)
+        original_payment_id = payment_id.split('_')[0] if '_' in payment_id else payment_id
+        state_val = f"imported:{original_payment_id}"
+        
         c.execute("SELECT id, vk_id, original_filename FROM vedomosti_users WHERE state = ?", (state_val,))
         existing_record = c.fetchone()
+        
         if not existing_record:
             log.error("No record found for payment_id=%s with state=%s", payment_id, state_val)
             conn.close()
@@ -318,16 +359,28 @@ def update_vedomosti_status_by_payment(payment_id: str, status: str, reason: str
         affected = c.rowcount
         conn.close()
         log.info("Updated vedomosti_users for payment=%s -> status=%s reason=%s affected=%s", payment_id, status, reason, affected)
+        
+        # Обновляем в памяти
+        update_payment_in_memory(payment_id, status, reason)
+        
+    except Exception:
+        log.exception("Failed to update vedomosti status for payment %s", payment_id)
+
+
+def update_payment_in_memory(payment_id: str, status: str, reason: str = None):
+    """Обновляет статус платежа в памяти."""
+    try:
         for user_id, payments in user_payments.items():
             for payment in payments:
-                if payment["id"] == payment_id:
+                # Проверяем и исходный payment_id и уникальный
+                if payment["id"] == payment_id or payment.get("original_payment_id") == payment_id:
                     payment["status"] = status
                     if reason is not None:
                         payment["disagree_reason"] = reason
                     log.info("Updated payment %s status to %s in memory for user %s", payment_id, status, user_id)
                     break
     except Exception:
-        log.exception("Failed to update vedomosti status for payment %s", payment_id)
+        log.exception("Failed to update payment in memory for payment_id %s", payment_id)
 
 def fetch_unprocessed_vedomosti():
     rows = []
@@ -652,9 +705,13 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
     page_items = statements[start:end]
     rows = []
     for sid, label in page_items:
-        # Не вычисляем статус по всем пользователям — это может привести к некорректной маркировке.
+        # Ограничиваем длину кнопки для соответствия лимитам VK
+        if len(label) > 40:
+            button_label = label[:37] + "..."
+        else:
+            button_label = label
+            
         button_color = "primary"
-        button_label = label
         rows.append([
             {
                 "action": {
@@ -681,7 +738,7 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
     return json.dumps(kb, ensure_ascii=False)
 
 
-def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 6):
+def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 15):
     """Клавиатура списка выплат для конкретного пользователя с учетом его статусов."""
     total = len(user_payments_list)
     start = page * page_size
@@ -690,14 +747,21 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
     rows = []
     for idx, entry in enumerate(page_items, start=1 + start):
         sid = entry.get("id")
-        label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx)
         status = entry.get("status")
+        
+        # Учитываем статус при расчете максимальной длины
         if status == "agreed":
+            # Оставляем место для " " (3 символа) 
+            max_label_length = 37
+            base_label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx, max_label_length)
+            button_label = f"{base_label} "
             button_color = "positive"
-            button_label = f"{label} (Согласовано)"
         else:
+            # Полная длина для обычных кнопок
+            base_label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx, 40)
+            button_label = base_label
             button_color = "primary"
-            button_label = label
+            
         rows.append([
             {
                 "action": {
@@ -804,87 +868,149 @@ def disagreement_decision_keyboard(payment_id: str, reason_label: str):
     }
     return json.dumps(kb, ensure_ascii=False)
 def format_payment_text(data: dict) -> str:
+    """Форматирует текст выплаты в красивом виде, используя данные из CSV файла."""
     try:
         vk_id_str = str(data.get('vk_id','')).strip()
         original_filename = data.get('original_filename') or ''
+        
+        if not vk_id_str or not original_filename:
+            return format_payment_text_fallback(data)
+        
+        # Получаем base_name для поиска CSV файла
         base_name = os.path.splitext(original_filename)[0] if original_filename else ''
-        row = None
-        if vk_id_str and base_name:
-            csv_path = _find_curator_csv(base_name, int(vk_id_str))
-            if csv_path:
-                try:
-                    df = pd.read_csv(csv_path, dtype=str)
-                except Exception:
-                    df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
-                if isinstance(df, pd.DataFrame) and not df.empty and 'vk_id' in df.columns:
-                    r = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == vk_id_str)]
-                    if not r.empty:
-                        row = r.fillna('').iloc[0]
-        def val(key_csv, key_mapped=None):
-            if row is not None and key_csv in row:
-                return row.get(key_csv, '')
-            if key_mapped:
-                return data.get(key_mapped, '')
-            return data.get(key_csv, '')
-        lines = []
-        lines.append(f"ФИО для консоли: {val('console', 'fio')}")
-        lines.append(f"Номер телефона для консоли: {val('phone', 'phone')}")
-        lines.append(f"Куратор: {val('name','curator')}")
-        lines.append(f"vk_id: {vk_id_str}")
-        lines.append(f"Почта: {val('email','mail')}")
-        lines.append(f"Группы: {val('groups','groups')}")
-        lines.append(f"Всего детей: {val('stud_all','total_children')}")
-        lines.append(f"Колво учеников с тарифом с репетитором: {val('stud_rep','with_tutor')}")
-        lines.append(f"Оклад за ученика: {val('base','salary_per_student')}")
-        lines.append(f"Сумма оклада: {val('stud_salary','salary_sum')}")
-        lines.append(f"retention: {val('rr','retention')}")
-        lines.append(f"Оплата за retention: {val('rr_salary','retention_pay')}")
-        lines.append(f"okk: {val('okk','okk')}")
-        lines.append(f"Оплата за okk: {val('okk_salary','okk_pay')}")
-        lines.append(f"Сумма КПИ: {val('kpi_total','kpi_sum')}")
-        lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
-        lines.append(f"Сумма к оплате за проверки: {val('checks_salary','checks_sum')}")
-        lines.append(f"Дополнительные проверки: {val('dop_checks','extra_checks')}")
-        lines.append(f"Учебная поддержка: {val('up','support')}")
-        lines.append(f"Вебинары: {val('webs','webinars')}")
-        lines.append(f"Чаты: {val('chats','chats')}")
-        lines.append(f"Групповые созвоны: {val('callsg','group_calls')}")
-        lines.append(f"Индивидуальные созвоны: {val('callsp','individual_calls')}")
-        lines.append(f"Стол заказов: {val('meth','orders_table')}")
-        lines.append(f"Премия от СК: {val('dop_sk','bonus')}")
-        lines.append(f"Штрафы: {val('fines','penalties')}")
-        lines.append(f"Итого: {val('total','total')}")
-        return "\n".join(lines)
+        
+        # Ищем CSV файл
+        csv_path = _find_curator_csv(base_name, int(vk_id_str))
+        if not csv_path:
+            return format_payment_text_fallback(data)
+        
+        # Читаем CSV
+        try:
+            df = pd.read_csv(csv_path, dtype=str)
+        except Exception:
+            try:
+                df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+            except Exception:
+                return format_payment_text_fallback(data)
+        
+        if df is None or df.empty or 'vk_id' not in df.columns:
+            return format_payment_text_fallback(data)
+        
+        # Находим строку пользователя
+        row = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == vk_id_str)]
+        if row.empty:
+            return format_payment_text_fallback(data)
+        
+        p = row.fillna('0').iloc[0]
+        
+        # Используем красивое форматирование как в format_message
+        base = (f"=== Согласование выплаты ==="
+                f"\nВедомость: {original_filename.replace('.csv', '')}"
+                f"\nКуратор: {p.get('name', '')}"
+                f"\nТип куратора: {p.get('type', '')}"
+                f"\nПочта на платформе: {p.get('email', '')}"
+                f"\nГруппы куратора: {p.get('groups', '')}\n")
+
+        studs_section = ""
+        stud_all = _to_int_safe(p.get('stud_all'))
+        if stud_all > 0:
+            studs_section = (f"\n[Сопровождение учеников]"
+                             f"\nВсего учеников в группах: {stud_all}"
+                             f"\nСтавка за ученика: {_to_int_safe(p.get('base'))}₽")
+            stud_rep = _to_int_safe(p.get('stud_rep'))
+            if stud_rep > 0:
+                studs_section += (f"\nИз них с репетитором: {stud_rep}"
+                                  f"\nДоплата за учеников с репетитором: 50₽ / чел")
+            studs_section += f"\n→ Всего за сопровождение: {_to_int_safe(p.get('stud_salary'))}₽\n"
+            studs_section += (f"\nПоказатель RR: {p.get('rr','')} | KPI за RR: {_to_float_str_money(p.get('rr_salary'))}₽"
+                              f"\nПоказатель ОКК: {p.get('okk','')} | KPI за ОКК: {_to_float_str_money(p.get('okk_salary'))}₽"
+                              f"\n→ Всего KPI (RR+OKK): {_to_float_str_money(p.get('kpi_total'))}₽\n")
+
+        checks_section = ""
+        checks_salary = _to_int_safe(p.get('checks_salary'))
+        dop_checks = _to_int_safe(p.get('dop_checks'))
+        if checks_salary > 0 or dop_checks > 0:
+            checks_section = f"\n[Проверки]"
+            if checks_salary > 0:
+                checks_section += f"\n→ Проверка домашних работ: {checks_salary}₽"
+            if dop_checks > 0:
+                checks_section += f"\n→ Дополнительно – за проверки (данные СК): {dop_checks}₽"
+            checks_section += "\n"
+
+        # Дополнительная деятельность
+        extras_keys = ['up','chats','webs','meth','dop_sk','callsg','callsp']
+        extras_names = {
+            'up': 'За учебную поддержку',
+            'chats': 'Модерация чатов',
+            'webs': 'Модерация вебинаров',
+            'callsg': 'Групповые созвоны',
+            'callsp': 'Индивидуальные созвоны',
+            'dop_sk': 'Доп. суммы, начисленные СК',
+            'meth': 'Стол заказов',
+        }
+        extras_total = sum(_to_int_safe(p.get(k)) for k in extras_keys)
+        dops_section = ""
+        if extras_total > 0:
+            dops_section = "\n[ Иная деятельность]"
+            for k in extras_keys:
+                v = _to_int_safe(p.get(k))
+                if v > 0:
+                    dops_section += f"\n{extras_names[k]}: {v}₽"
+            dops_section += f"\n→ Всего в категории: {extras_total}₽"
+
+        # Штрафы
+        fines_val = _to_int_safe(p.get('fines'))
+        fines_section = f"\n\nШтрафы: -{fines_val}₽" if fines_val > 0 else f"\n\nШтрафы: отсутствуют"
+
+        # Итого
+        total_section = f"\n\nИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
+        
+        # Финальная информация
+        final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
+                 "\nНажмите «Не согласен», если Вы не согласны с каким-либо из пунктов"
+                 "\nПросмотр ведомости возможен в течение 36 часов")
+
+        msg = base + studs_section + checks_section + dops_section + fines_section + total_section + final
+        return msg
+        
     except Exception:
-        lines = []
-        lines.append(f"ФИО для консоли: {data.get('fio','')}")
-        lines.append(f"Номер телефона для консоли: {data.get('phone','')}")
-        lines.append(f"Куратор: {data.get('curator','')}")
-        lines.append(f"vk_id: {data.get('vk_id','')}")
-        lines.append(f"Почта: {data.get('mail','')}")
-        lines.append(f"Группы: {data.get('groups','')}")
-        lines.append(f"Всего детей: {data.get('total_children','')}")
-        lines.append(f"Колво учеников с тарифом с репетитором: {data.get('with_tutor','')}")
-        lines.append(f"Оклад за ученика: {data.get('salary_per_student','')}")
-        lines.append(f"Сумма оклада: {data.get('salary_sum','')}")
-        lines.append(f"retention: {data.get('retention','')}")
-        lines.append(f"Оплата за retention: {data.get('retention_pay','')}")
-        lines.append(f"okk: {data.get('okk','')}")
-        lines.append(f"Оплата за okk: {data.get('okk_pay','')}")
-        lines.append(f"Сумма КПИ: {data.get('kpi_sum','')}")
-        lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
-        lines.append(f"Сумма к оплате за проверки: {data.get('checks_sum','')}")
-        lines.append(f"Дополнительные проверки: {data.get('extra_checks','')}")
-        lines.append(f"Учебная поддержка: {data.get('support','')}")
-        lines.append(f"Вебинары: {data.get('webinars','')}")
-        lines.append(f"Чаты: {data.get('chats','')}")
-        lines.append(f"Групповые созвоны: {data.get('group_calls','')}")
-        lines.append(f"Индивидуальные созвоны: {data.get('individual_calls','')}")
-        lines.append(f"Стол заказов: {data.get('orders_table','')}")
-        lines.append(f"Премия от СК: {data.get('bonus','')}")
-        lines.append(f"Штрафы: {data.get('penalties','')}")
-        lines.append(f"Итого: {data.get('total','')}")
-        return "\n".join(lines)
+        log.exception("Failed to format payment text with enhanced format, using fallback")
+        return format_payment_text_fallback(data)
+
+
+def format_payment_text_fallback(data: dict) -> str:
+    """Простое форматирование выплаты (fallback)."""
+    lines = []
+    lines.append("=== Согласование выплаты 💰 ===")
+    lines.append(f"ФИО для консоли: {data.get('fio','')}")
+    lines.append(f"Номер телефона для консоли: {data.get('phone','')}")
+    lines.append(f"Куратор: {data.get('curator','')}")
+    lines.append(f"vk_id: {data.get('vk_id','')}")
+    lines.append(f"Почта: {data.get('mail','')}")
+    lines.append(f"Группы: {data.get('groups','')}")
+    lines.append(f"Всего детей: {data.get('total_children','')}")
+    lines.append(f"Колво учеников с тарифом с репетитором: {data.get('with_tutor','')}")
+    lines.append(f"Оклад за ученика: {data.get('salary_per_student','')}")
+    lines.append(f"Сумма оклада: {data.get('salary_sum','')}")
+    lines.append(f"retention: {data.get('retention','')}")
+    lines.append(f"Оплата за retention: {data.get('retention_pay','')}")
+    lines.append(f"okk: {data.get('okk','')}")
+    lines.append(f"Оплата за okk: {data.get('okk_pay','')}")
+    lines.append(f"Сумма КПИ: {data.get('kpi_sum','')}")
+    lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
+    lines.append(f"Сумма к оплате за проверки: {data.get('checks_sum','')}")
+    lines.append(f"Дополнительные проверки: {data.get('extra_checks','')}")
+    lines.append(f"Учебная поддержка: {data.get('support','')}")
+    lines.append(f"Вебинары: {data.get('webinars','')}")
+    lines.append(f"Чаты: {data.get('chats','')}")
+    lines.append(f"Групповые созвоны: {data.get('group_calls','')}")
+    lines.append(f"Индивидуальные созвоны: {data.get('individual_calls','')}")
+    lines.append(f"Стол заказов: {data.get('orders_table','')}")
+    lines.append(f"Премия от СК: {data.get('bonus','')}")
+    lines.append(f"Штрафы: {data.get('penalties','')}")
+    lines.append(f"Итого: {data.get('total','')}")
+    lines.append(f"\nПросмотр ведомости возможен в течение 36 часов")
+    return "\n".join(lines)
 
 def map_reason_to_type(reason_label: str) -> str:
     mapping = {
@@ -1032,12 +1158,29 @@ def _to_float_str_money(value) -> str:
     except Exception:
         return '0'
 
-def _format_payment_label(original_filename: str, idx: int) -> str:
-    """Форматирует название выплаты для кнопки, убирая расширение .csv"""
+def _format_payment_label(original_filename: str, idx: int, max_length: int = 30, created_at: float = None, db_id: int = None) -> str:
+    """Форматирует название выплаты для кнопки, убирая расширение .csv и ограничивая длину"""
     if original_filename:
         # Убираем расширение .csv
         base_name = os.path.splitext(original_filename)[0]
-        return base_name
+        
+        # Если есть временная метка, добавляем её для различия одинаковых ведомостей
+        if created_at and db_id:
+            import time
+            try:
+                # Форматируем дату как день/месяц
+                date_str = time.strftime('%d.%m', time.localtime(created_at))
+                full_label = f"{base_name} ({date_str})"
+            except Exception:
+                # Fallback - используем db_id
+                full_label = f"{base_name} #{db_id}"
+        else:
+            full_label = base_name
+        
+        # Ограничиваем длину
+        if len(full_label) > max_length:
+            return full_label[:max_length-3] + "..."
+        return full_label
     else:
         return f"Ведомость {idx}"
 
@@ -1138,16 +1281,183 @@ def get_payments_for_user(user_id: int):
         return user_payments.get(user_id, []).copy()  # Возвращаем копию для безопасности
 
 
+def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
+    """Загружает ВСЕ ведомости пользователя из базы данных, не только те что в памяти.
+    Возвращает список в том же формате что и get_payments_for_user."""
+    if not os.path.exists(DB_PATH):
+        log.warning("DB file not found: %s", DB_PATH)
+        return []
+    
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        # Получаем все ведомости пользователя, отсортированные по времени создания (новые сначала)
+        c.execute("""
+            SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+            FROM vedomosti_users 
+            WHERE vk_id = ? AND state LIKE 'imported:%'
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+        """, (str(user_id), limit))
+        rows = c.fetchall()
+        conn.close()
+        
+        payments = []
+        for db_row in rows:
+            try:
+                db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db, created_at_db = db_row
+                
+                if not state or not state.startswith('imported:'):
+                    continue
+                
+                parts = state.split(':', 1)
+                if len(parts) != 2 or not parts[1]:
+                    continue
+                
+                payment_id = parts[1]
+                
+                # Создаем уникальный payment_id на основе db_id для старых записей с дублирующимися payment_id
+                unique_payment_id = f"{payment_id}_{db_id}" if payment_id else f"payment_{db_id}"
+                
+                # Сначала проверяем, есть ли эта ведомость в памяти (по исходному payment_id)
+                memory_payment = None
+                with user_payments_lock:
+                    for p in user_payments.get(user_id, []):
+                        if p["id"] == payment_id:
+                            memory_payment = p
+                            break
+                
+                if memory_payment:
+                    # Используем данные из памяти но с уникальным ID
+                    memory_copy = memory_payment.copy()
+                    memory_copy["id"] = unique_payment_id
+                    memory_copy["db_id"] = db_id  # Сохраняем db_id для отладки
+                    payments.append(memory_copy)
+                else:
+                    # Загружаем из CSV файла
+                    row_dict = {}
+                    if personal_path and os.path.exists(personal_path):
+                        try:
+                            df = get_cached_csv_data(personal_path)
+                            if isinstance(df, pd.DataFrame) and not df.empty:
+                                row_dict = df.iloc[0].to_dict()
+                        except Exception:
+                            log.warning("Failed to read CSV for payment %s path=%s", unique_payment_id, personal_path)
+                    
+                    payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+                    
+                    entry = {
+                        "id": unique_payment_id,
+                        "data": payment_data,
+                        "created_at": float(created_at_db) if created_at_db else time.time(),
+                        "status": status_db or "new",
+                        "db_id": db_id,  # Сохраняем db_id для отладки
+                        "original_payment_id": payment_id  # Сохраняем исходный payment_id
+                    }
+                    
+                    if disagree_reason_db:
+                        entry["disagree_reason"] = disagree_reason_db
+                        
+                    payments.append(entry)
+                    
+            except Exception:
+                log.exception("Error loading payment from DB row %s", db_row)
+        
+        log.info("Loaded %d total payments for user %s from DB (limit=%d)", len(payments), user_id, limit)
+        return payments
+        
+    except Exception:
+        log.exception("Failed to load all payments for user %s from DB", user_id)
+        return []
+
+
 def find_payment(user_id: int, payment_id: str):
+    # Сначала ищем в памяти (быстрее и актуальнее)
     with user_payments_lock:
         for p in user_payments.get(user_id, []):
             if p["id"] == payment_id:
                 return p
-    return None
+    
+    # Если не нашли в памяти, ищем в базе данных
+    try:
+        if not os.path.exists(DB_PATH):
+            return None
+        
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        
+        # Сначала пробуем найти по полному уникальному payment_id (новый формат)
+        if '_' in payment_id:
+            # Извлекаем db_id из уникального payment_id
+            try:
+                db_id = int(payment_id.split('_')[-1])
+                c.execute("""
+                    SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+                    FROM vedomosti_users 
+                    WHERE id = ? AND vk_id = ?
+                """, (db_id, str(user_id)))
+            except ValueError:
+                # Если не удалось извлечь db_id, пробуем старый способ
+                c.execute("""
+                    SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+                    FROM vedomosti_users 
+                    WHERE vk_id = ? AND state = ?
+                """, (str(user_id), f"imported:{payment_id}"))
+        else:
+            # Старый формат payment_id
+            c.execute("""
+                SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+                FROM vedomosti_users 
+                WHERE vk_id = ? AND state = ?
+                LIMIT 1
+            """, (str(user_id), f"imported:{payment_id}"))
+        
+        row = c.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+            
+        db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db, created_at_db = row
+        
+        # Загружаем данные из CSV файла
+        row_dict = {}
+        if personal_path and os.path.exists(personal_path):
+            try:
+                df = get_cached_csv_data(personal_path)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    row_dict = df.iloc[0].to_dict()
+            except Exception:
+                log.warning("Failed to read CSV for find_payment %s path=%s", payment_id, personal_path)
+        
+        payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+        
+        # Используем уникальный payment_id
+        original_payment_id = state.split(':', 1)[1] if ':' in state else payment_id
+        unique_payment_id = f"{original_payment_id}_{db_id}"
+        
+        entry = {
+            "id": unique_payment_id,
+            "data": payment_data,
+            "created_at": float(created_at_db) if created_at_db else time.time(),
+            "status": status_db or "new",
+            "db_id": db_id,
+            "original_payment_id": original_payment_id
+        }
+        
+        if disagree_reason_db:
+            entry["disagree_reason"] = disagree_reason_db
+            
+        log.info("Found payment %s for user %s in DB", payment_id, user_id)
+        return entry
+        
+    except Exception:
+        log.exception("Failed to find payment %s for user %s in DB", payment_id, user_id)
+        return None
 
 def send_payment_message(user_id: int, payment_entry: dict):
     """Отправляет сообщение с текстом выплаты и inline-кнопками."""
-    text = "Новая выплата:\n\n" + format_payment_text(payment_entry["data"])
+    text = "У тебя появилась новая ведомость на согласование 📋\n\n" + format_payment_text(payment_entry["data"])
     keyboard = inline_confirm_keyboard(payment_id=payment_entry["id"])
     
     success = safe_vk_send(user_id, text, keyboard)
@@ -1369,14 +1679,14 @@ def handle_message_event(event):
                     log.info("User %s tried to open already confirmed statement %s", user_id, sid)
                     return
                 
-                statement_text = "Открыта Ведомость:\n\n" + format_payment_text(p["data"])
+                statement_text = "Открыта ведомость \n\n" + format_payment_text(p["data"])
                 safe_vk_send(user_id, statement_text, inline_confirm_keyboard(payment_id=sid))
                 user_last_opened_payment[user_id] = sid  # Запоминаем последнюю открытую выплату
                 log.info("User %s opened statement %s", user_id, sid)
             else:
                 safe_vk_send(user_id, "Ведомость не найдена (возможно устарела).")
         elif cmd == "to_list":
-            payments = get_payments_for_user(user_id)
+            payments = get_all_payments_for_user_from_db(user_id)
             if not payments:
                 safe_vk_send(user_id, "У вас нет выплат.", chat_bottom_keyboard())
                 return
@@ -1385,7 +1695,7 @@ def handle_message_event(event):
             return
         elif cmd == "payments_page":
             page = int(payload.get("page", 0))
-            payments = get_payments_for_user(user_id)
+            payments = get_all_payments_for_user_from_db(user_id)
             if not payments:
                 safe_vk_send(user_id, "У вас нет выплат.")
                 return
@@ -1456,7 +1766,7 @@ def handle_message_new(event):
                         log.info("User %s tried to open already confirmed statement %s via payload", from_id, sid)
                         return
                     
-                    statement_text = "Открыта Ведомость:\n\n" + format_payment_text(p["data"])
+                    statement_text = "Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
@@ -1594,7 +1904,7 @@ def handle_message_new(event):
                     )
                 return
             if cmd == "to_list":
-                payments = get_payments_for_user(from_id)
+                payments = get_all_payments_for_user_from_db(from_id)
                 if not payments:
                     vk.messages.send(
                         user_id=from_id,
@@ -1617,7 +1927,7 @@ def handle_message_new(event):
                 return
             if cmd == "payments_page":
                 page = int(payload.get("page", 0))
-                payments = get_payments_for_user(from_id)
+                payments = get_all_payments_for_user_from_db(from_id)
                 if not payments:
                     vk.messages.send(user_id=from_id, random_id=vk_api.utils.get_random_id(), message="У вас нет выплат.")
                     return
@@ -1683,7 +1993,7 @@ def handle_message_new(event):
                     )
                 return
         if text.lower() == "к списку выплат" or text == "К списку выплат":
-            payments = get_payments_for_user(from_id)
+            payments = get_all_payments_for_user_from_db(from_id)
             if not payments:
                 vk.messages.send(
                     user_id=from_id,
@@ -1707,7 +2017,7 @@ def handle_message_new(event):
         m = re.match(r"^\s*Ведомость\s+(\d+)\s*$", text, flags=re.IGNORECASE)
         if m:
             idx = int(m.group(1)) - 1
-            payments = get_payments_for_user(from_id)
+            payments = get_all_payments_for_user_from_db(from_id)
             if 0 <= idx < len(payments):
                 p = payments[idx]
                 log.info("User %s trying to open statement %s by text with status: %s", from_id, p["id"], p.get("status"))
@@ -1719,7 +2029,7 @@ def handle_message_new(event):
                     )
                     log.info("User %s tried to open already confirmed statement %s by text", from_id, p["id"])
                     return
-                statement_text = f"Открыта Ведомость (id={p['id']}):\n\n" + format_payment_text(p["data"])
+                statement_text = f"Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
                 vk.messages.send(
                     user_id=from_id,
                     random_id=vk_api.utils.get_random_id(),
