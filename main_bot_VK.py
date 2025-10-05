@@ -31,7 +31,7 @@ def total_payments_count():
     with user_payments_lock:
         return sum(len(payments) for payments in user_payments.values())
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
@@ -370,15 +370,21 @@ def update_vedomosti_status_by_payment(payment_id: str, status: str, reason: str
 def update_payment_in_memory(payment_id: str, status: str, reason: str = None):
     """Обновляет статус платежа в памяти."""
     try:
+        updated_count = 0
         for user_id, payments in user_payments.items():
             for payment in payments:
                 # Проверяем и исходный payment_id и уникальный
                 if payment["id"] == payment_id or payment.get("original_payment_id") == payment_id:
+                    old_status = payment.get("status", "unknown")
                     payment["status"] = status
                     if reason is not None:
                         payment["disagree_reason"] = reason
-                    log.info("Updated payment %s status to %s in memory for user %s", payment_id, status, user_id)
+                    log.info("Updated payment %s status %s->%s in memory for user %s (db_id=%s)", 
+                            payment_id, old_status, status, user_id, payment.get("db_id"))
+                    updated_count += 1
                     break
+        if updated_count == 0:
+            log.warning("No payments found in memory to update for payment_id %s", payment_id)
     except Exception:
         log.exception("Failed to update payment in memory for payment_id %s", payment_id)
 
@@ -1320,10 +1326,12 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                 unique_payment_id = f"{payment_id}_{db_id}" if payment_id else f"payment_{db_id}"
                 
                 # Сначала проверяем, есть ли эта ведомость в памяти (по исходному payment_id)
+                # НО только для той же записи БД (чтобы избежать дублирования разных ведомостей)
                 memory_payment = None
                 with user_payments_lock:
                     for p in user_payments.get(user_id, []):
-                        if p["id"] == payment_id:
+                        # Проверяем и исходный payment_id И что это та же запись БД
+                        if p["id"] == payment_id and p.get("db_id") == db_id:
                             memory_payment = p
                             break
                 
@@ -1333,6 +1341,7 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                     memory_copy["id"] = unique_payment_id
                     memory_copy["db_id"] = db_id  # Сохраняем db_id для отладки
                     payments.append(memory_copy)
+                    log.debug("Used memory data for payment %s (db_id=%d) -> unique_id=%s", payment_id, db_id, unique_payment_id)
                 else:
                     # Загружаем из CSV файла
                     row_dict = {}
@@ -1372,10 +1381,12 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
 
 
 def find_payment(user_id: int, payment_id: str):
+    log.debug("find_payment called: user_id=%s, payment_id=%s", user_id, payment_id)
     # Сначала ищем в памяти (быстрее и актуальнее)
     with user_payments_lock:
         for p in user_payments.get(user_id, []):
             if p["id"] == payment_id:
+                log.debug("Found payment %s in memory for user %s", payment_id, user_id)
                 return p
     
     # Если не нашли в памяти, ищем в базе данных
@@ -1416,8 +1427,10 @@ def find_payment(user_id: int, payment_id: str):
         conn.close()
         
         if not row:
+            log.debug("Payment %s not found in DB for user %s", payment_id, user_id)
             return None
             
+        log.debug("Found payment %s in DB for user %s", payment_id, user_id)
         db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db, created_at_db = row
         
         # Загружаем данные из CSV файла
@@ -1682,7 +1695,7 @@ def handle_message_event(event):
                 statement_text = "Открыта ведомость \n\n" + format_payment_text(p["data"])
                 safe_vk_send(user_id, statement_text, inline_confirm_keyboard(payment_id=sid))
                 user_last_opened_payment[user_id] = sid  # Запоминаем последнюю открытую выплату
-                log.info("User %s opened statement %s", user_id, sid)
+                log.info("User %s opened statement %s (unique_payment_id=%s)", user_id, sid, sid)
             else:
                 safe_vk_send(user_id, "Ведомость не найдена (возможно устарела).")
         elif cmd == "to_list":
@@ -1720,10 +1733,15 @@ def handle_message_new(event):
         if text in ("Согласен с выплатой", "Не согласен с выплатой"):
             # Используем последнюю открытую выплату
             last_payment_id = user_last_opened_payment.get(from_id)
+            log.info("User %s using button agreement, last_payment_id=%s", from_id, last_payment_id)
             if not last_payment_id:
                 safe_vk_send(from_id, "Сначала откройте ведомость из списка выплат.")
                 return
             p = find_payment(from_id, last_payment_id)
+            log.info("User %s find_payment result for %s: %s", from_id, last_payment_id, "Found" if p else "Not found")
+            if p:
+                log.info("Found payment details: db_id=%s, original_filename=%s, status=%s", 
+                        p.get("db_id"), p.get("data", {}).get("original_filename"), p.get("status"))
             if not p:
                 safe_vk_send(from_id, "Ведомость не найдена. Откройте ведомость заново.")
                 return
@@ -1774,7 +1792,7 @@ def handle_message_new(event):
                         keyboard=inline_confirm_keyboard(payment_id=sid)
                     )
                     user_last_opened_payment[from_id] = sid  # Запоминаем последнюю открытую выплату
-                    log.info("User %s opened statement %s via payload", from_id, sid)
+                    log.info("User %s opened statement %s via payload (unique_payment_id=%s)", from_id, sid, sid)
                     return
                 else:
                     vk.messages.send(
