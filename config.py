@@ -8,6 +8,6 @@ DRY_RUN = False
 GROUP_ID = '226458589'
 # новый vk_token
 VK_TOKEN = 'vk1.a.AQcPh1p7CojiKG4RCsnfawdsMEfH71A6Wcyd2eoQhm6aqb4xX9ugsr5aYjXji6A76G2gPg1BbjkAqlD4KHAxCBjp4R10qvVT8UgtXIH1Je5eOhccYKMKNsrnFTU9FyZAB-WziFJWElWjv78iGrgiv9EdaKF8c-RqFRu8isiGNylqBq-L38CN7Kwsm-TBxvJ_1DOsOPgz4GrurDFQTpXWwA'
-NOTIFY_TEXT = 'У вас появилась новая выплата, нажмите, пожалуйста, на кнопку "К списку выплат"'  # опционально
+NOTIFY_TEXT = 'У тебя появилась новая ведомость на согласование 📋\n\nНажми на кнопку «К списку выплат» под клавиатурой, чтобы перейти.\n\nПросмотр ведомости возможен в течение 36 часов с момента получения этого сообщения ⏰'  # опционально
 DB_PATH = "/Users/mac/Desktop/script/botTGMONEY/hosting.db"
 ARCHIVE_DELAY_HOURS = 36.0

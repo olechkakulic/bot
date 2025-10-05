@@ -804,87 +804,149 @@ def disagreement_decision_keyboard(payment_id: str, reason_label: str):
     }
     return json.dumps(kb, ensure_ascii=False)
 def format_payment_text(data: dict) -> str:
+    """Форматирует текст выплаты в красивом виде, используя данные из CSV файла."""
     try:
         vk_id_str = str(data.get('vk_id','')).strip()
         original_filename = data.get('original_filename') or ''
+        
+        if not vk_id_str or not original_filename:
+            return format_payment_text_fallback(data)
+        
+        # Получаем base_name для поиска CSV файла
         base_name = os.path.splitext(original_filename)[0] if original_filename else ''
-        row = None
-        if vk_id_str and base_name:
-            csv_path = _find_curator_csv(base_name, int(vk_id_str))
-            if csv_path:
-                try:
-                    df = pd.read_csv(csv_path, dtype=str)
-                except Exception:
-                    df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
-                if isinstance(df, pd.DataFrame) and not df.empty and 'vk_id' in df.columns:
-                    r = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == vk_id_str)]
-                    if not r.empty:
-                        row = r.fillna('').iloc[0]
-        def val(key_csv, key_mapped=None):
-            if row is not None and key_csv in row:
-                return row.get(key_csv, '')
-            if key_mapped:
-                return data.get(key_mapped, '')
-            return data.get(key_csv, '')
-        lines = []
-        lines.append(f"ФИО для консоли: {val('console', 'fio')}")
-        lines.append(f"Номер телефона для консоли: {val('phone', 'phone')}")
-        lines.append(f"Куратор: {val('name','curator')}")
-        lines.append(f"vk_id: {vk_id_str}")
-        lines.append(f"Почта: {val('email','mail')}")
-        lines.append(f"Группы: {val('groups','groups')}")
-        lines.append(f"Всего детей: {val('stud_all','total_children')}")
-        lines.append(f"Колво учеников с тарифом с репетитором: {val('stud_rep','with_tutor')}")
-        lines.append(f"Оклад за ученика: {val('base','salary_per_student')}")
-        lines.append(f"Сумма оклада: {val('stud_salary','salary_sum')}")
-        lines.append(f"retention: {val('rr','retention')}")
-        lines.append(f"Оплата за retention: {val('rr_salary','retention_pay')}")
-        lines.append(f"okk: {val('okk','okk')}")
-        lines.append(f"Оплата за okk: {val('okk_salary','okk_pay')}")
-        lines.append(f"Сумма КПИ: {val('kpi_total','kpi_sum')}")
-        lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
-        lines.append(f"Сумма к оплате за проверки: {val('checks_salary','checks_sum')}")
-        lines.append(f"Дополнительные проверки: {val('dop_checks','extra_checks')}")
-        lines.append(f"Учебная поддержка: {val('up','support')}")
-        lines.append(f"Вебинары: {val('webs','webinars')}")
-        lines.append(f"Чаты: {val('chats','chats')}")
-        lines.append(f"Групповые созвоны: {val('callsg','group_calls')}")
-        lines.append(f"Индивидуальные созвоны: {val('callsp','individual_calls')}")
-        lines.append(f"Стол заказов: {val('meth','orders_table')}")
-        lines.append(f"Премия от СК: {val('dop_sk','bonus')}")
-        lines.append(f"Штрафы: {val('fines','penalties')}")
-        lines.append(f"Итого: {val('total','total')}")
-        return "\n".join(lines)
+        
+        # Ищем CSV файл
+        csv_path = _find_curator_csv(base_name, int(vk_id_str))
+        if not csv_path:
+            return format_payment_text_fallback(data)
+        
+        # Читаем CSV
+        try:
+            df = pd.read_csv(csv_path, dtype=str)
+        except Exception:
+            try:
+                df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+            except Exception:
+                return format_payment_text_fallback(data)
+        
+        if df is None or df.empty or 'vk_id' not in df.columns:
+            return format_payment_text_fallback(data)
+        
+        # Находим строку пользователя
+        row = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == vk_id_str)]
+        if row.empty:
+            return format_payment_text_fallback(data)
+        
+        p = row.fillna('0').iloc[0]
+        
+        # Используем красивое форматирование как в format_message
+        base = (f"=== Согласование выплаты 💰 ==="
+                f"\nВедомость: {original_filename.replace('.csv', '')}"
+                f"\nКуратор: {p.get('name', '')}"
+                f"\nТип куратора: {p.get('type', '')}"
+                f"\nПочта на платформе: {p.get('email', '')}"
+                f"\nГруппы куратора: {p.get('groups', '')}\n")
+
+        studs_section = ""
+        stud_all = _to_int_safe(p.get('stud_all'))
+        if stud_all > 0:
+            studs_section = (f"\n[💼 Сопровождение учеников]"
+                             f"\nВсего учеников в группах: {stud_all}"
+                             f"\nСтавка за ученика: {_to_int_safe(p.get('base'))}₽")
+            stud_rep = _to_int_safe(p.get('stud_rep'))
+            if stud_rep > 0:
+                studs_section += (f"\nИз них с репетитором: {stud_rep}"
+                                  f"\nДоплата за учеников с репетитором: 50₽ / чел")
+            studs_section += f"\n→ Всего за сопровождение: {_to_int_safe(p.get('stud_salary'))}₽\n"
+            studs_section += (f"\n📈 Показатель RR: {p.get('rr','')} | KPI за RR: {_to_float_str_money(p.get('rr_salary'))}₽"
+                              f"\n🎯 Показатель ОКК: {p.get('okk','')} | KPI за ОКК: {_to_float_str_money(p.get('okk_salary'))}₽"
+                              f"\n→ Всего KPI (RR+OKK): {_to_float_str_money(p.get('kpi_total'))}₽\n")
+
+        checks_section = ""
+        checks_salary = _to_int_safe(p.get('checks_salary'))
+        dop_checks = _to_int_safe(p.get('dop_checks'))
+        if checks_salary > 0 or dop_checks > 0:
+            checks_section = f"\n[✅ Проверки]"
+            if checks_salary > 0:
+                checks_section += f"\n→ Проверка домашних работ: {checks_salary}₽"
+            if dop_checks > 0:
+                checks_section += f"\n→ Дополнительно – за проверки (данные СК): {dop_checks}₽"
+            checks_section += "\n"
+
+        # Дополнительная деятельность
+        extras_keys = ['up','chats','webs','meth','dop_sk','callsg','callsp']
+        extras_names = {
+            'up': '📚 За учебную поддержку',
+            'chats': '💬 Модерация чатов',
+            'webs': '🎥 Модерация вебинаров',
+            'callsg': '👥 Групповые созвоны',
+            'callsp': '🎯 Индивидуальные созвоны',
+            'dop_sk': '💎 Доп. суммы, начисленные СК',
+            'meth': '📋 Стол заказов',
+        }
+        extras_total = sum(_to_int_safe(p.get(k)) for k in extras_keys)
+        dops_section = ""
+        if extras_total > 0:
+            dops_section = "\n[🚀 Иная деятельность]"
+            for k in extras_keys:
+                v = _to_int_safe(p.get(k))
+                if v > 0:
+                    dops_section += f"\n{extras_names[k]}: {v}₽"
+            dops_section += f"\n→ Всего в категории: {extras_total}₽"
+
+        # Штрафы
+        fines_val = _to_int_safe(p.get('fines'))
+        fines_section = f"\n\n⚠️ Штрафы: -{fines_val}₽" if fines_val > 0 else f"\n\n✅ Штрафы: отсутствуют"
+
+        # Итого
+        total_section = f"\n\n💰 ИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
+        
+        # Финальная информация
+        final = ("\n\n📋 Нажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
+                 "\n❌ Нажмите «Не согласен», если Вы не согласны с каким-либо из пунктов"
+                 "\n⏰ Просмотр ведомости возможен в течение 36 часов")
+
+        msg = base + studs_section + checks_section + dops_section + fines_section + total_section + final
+        return msg
+        
     except Exception:
-        lines = []
-        lines.append(f"ФИО для консоли: {data.get('fio','')}")
-        lines.append(f"Номер телефона для консоли: {data.get('phone','')}")
-        lines.append(f"Куратор: {data.get('curator','')}")
-        lines.append(f"vk_id: {data.get('vk_id','')}")
-        lines.append(f"Почта: {data.get('mail','')}")
-        lines.append(f"Группы: {data.get('groups','')}")
-        lines.append(f"Всего детей: {data.get('total_children','')}")
-        lines.append(f"Колво учеников с тарифом с репетитором: {data.get('with_tutor','')}")
-        lines.append(f"Оклад за ученика: {data.get('salary_per_student','')}")
-        lines.append(f"Сумма оклада: {data.get('salary_sum','')}")
-        lines.append(f"retention: {data.get('retention','')}")
-        lines.append(f"Оплата за retention: {data.get('retention_pay','')}")
-        lines.append(f"okk: {data.get('okk','')}")
-        lines.append(f"Оплата за okk: {data.get('okk_pay','')}")
-        lines.append(f"Сумма КПИ: {data.get('kpi_sum','')}")
-        lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
-        lines.append(f"Сумма к оплате за проверки: {data.get('checks_sum','')}")
-        lines.append(f"Дополнительные проверки: {data.get('extra_checks','')}")
-        lines.append(f"Учебная поддержка: {data.get('support','')}")
-        lines.append(f"Вебинары: {data.get('webinars','')}")
-        lines.append(f"Чаты: {data.get('chats','')}")
-        lines.append(f"Групповые созвоны: {data.get('group_calls','')}")
-        lines.append(f"Индивидуальные созвоны: {data.get('individual_calls','')}")
-        lines.append(f"Стол заказов: {data.get('orders_table','')}")
-        lines.append(f"Премия от СК: {data.get('bonus','')}")
-        lines.append(f"Штрафы: {data.get('penalties','')}")
-        lines.append(f"Итого: {data.get('total','')}")
-        return "\n".join(lines)
+        log.exception("Failed to format payment text with enhanced format, using fallback")
+        return format_payment_text_fallback(data)
+
+
+def format_payment_text_fallback(data: dict) -> str:
+    """Простое форматирование выплаты (fallback)."""
+    lines = []
+    lines.append("=== Согласование выплаты 💰 ===")
+    lines.append(f"ФИО для консоли: {data.get('fio','')}")
+    lines.append(f"Номер телефона для консоли: {data.get('phone','')}")
+    lines.append(f"Куратор: {data.get('curator','')}")
+    lines.append(f"vk_id: {data.get('vk_id','')}")
+    lines.append(f"Почта: {data.get('mail','')}")
+    lines.append(f"Группы: {data.get('groups','')}")
+    lines.append(f"Всего детей: {data.get('total_children','')}")
+    lines.append(f"Колво учеников с тарифом с репетитором: {data.get('with_tutor','')}")
+    lines.append(f"Оклад за ученика: {data.get('salary_per_student','')}")
+    lines.append(f"Сумма оклада: {data.get('salary_sum','')}")
+    lines.append(f"retention: {data.get('retention','')}")
+    lines.append(f"Оплата за retention: {data.get('retention_pay','')}")
+    lines.append(f"okk: {data.get('okk','')}")
+    lines.append(f"Оплата за okk: {data.get('okk_pay','')}")
+    lines.append(f"Сумма КПИ: {data.get('kpi_sum','')}")
+    lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
+    lines.append(f"Сумма к оплате за проверки: {data.get('checks_sum','')}")
+    lines.append(f"Дополнительные проверки: {data.get('extra_checks','')}")
+    lines.append(f"Учебная поддержка: {data.get('support','')}")
+    lines.append(f"Вебинары: {data.get('webinars','')}")
+    lines.append(f"Чаты: {data.get('chats','')}")
+    lines.append(f"Групповые созвоны: {data.get('group_calls','')}")
+    lines.append(f"Индивидуальные созвоны: {data.get('individual_calls','')}")
+    lines.append(f"Стол заказов: {data.get('orders_table','')}")
+    lines.append(f"Премия от СК: {data.get('bonus','')}")
+    lines.append(f"Штрафы: {data.get('penalties','')}")
+    lines.append(f"💰 Итого: {data.get('total','')}")
+    lines.append(f"\n⏰ Просмотр ведомости возможен в течение 36 часов")
+    return "\n".join(lines)
 
 def map_reason_to_type(reason_label: str) -> str:
     mapping = {
@@ -1278,7 +1340,7 @@ def find_payment(user_id: int, payment_id: str):
 
 def send_payment_message(user_id: int, payment_entry: dict):
     """Отправляет сообщение с текстом выплаты и inline-кнопками."""
-    text = "Новая выплата:\n\n" + format_payment_text(payment_entry["data"])
+    text = "У тебя появилась новая ведомость на согласование 📋\n\n" + format_payment_text(payment_entry["data"])
     keyboard = inline_confirm_keyboard(payment_id=payment_entry["id"])
     
     success = safe_vk_send(user_id, text, keyboard)
@@ -1500,7 +1562,7 @@ def handle_message_event(event):
                     log.info("User %s tried to open already confirmed statement %s", user_id, sid)
                     return
                 
-                statement_text = "Открыта Ведомость:\n\n" + format_payment_text(p["data"])
+                statement_text = "Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
                 safe_vk_send(user_id, statement_text, inline_confirm_keyboard(payment_id=sid))
                 user_last_opened_payment[user_id] = sid  # Запоминаем последнюю открытую выплату
                 log.info("User %s opened statement %s", user_id, sid)
@@ -1587,7 +1649,7 @@ def handle_message_new(event):
                         log.info("User %s tried to open already confirmed statement %s via payload", from_id, sid)
                         return
                     
-                    statement_text = "Открыта Ведомость:\n\n" + format_payment_text(p["data"])
+                    statement_text = "Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
@@ -1850,7 +1912,7 @@ def handle_message_new(event):
                     )
                     log.info("User %s tried to open already confirmed statement %s by text", from_id, p["id"])
                     return
-                statement_text = f"Открыта Ведомость (id={p['id']}):\n\n" + format_payment_text(p["data"])
+                statement_text = f"Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
                 vk.messages.send(
                     user_id=from_id,
                     random_id=vk_api.utils.get_random_id(),
