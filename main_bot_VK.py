@@ -1193,12 +1193,18 @@ def _format_payment_label(original_filename: str, idx: int, max_length: int = 30
         
         # Добавляем информацию о группах для различения
         if groups and groups.strip():
-            # Извлекаем краткое название группы (например "Группа 1" из "Аня Колотович | Группа 1")
+            # Извлекаем краткое название группы (например "1" из "Аня Колотович | Группа 1")
             group_info = groups.strip()
             if '|' in group_info:
                 group_part = group_info.split('|')[-1].strip()
                 if group_part:
-                    base_name = f"{base_name} ({group_part})"
+                    # Убираем слово "Группа" и берем только номер/название
+                    if group_part.lower().startswith('группа '):
+                        group_clean = group_part[7:]  # Убираем "Группа "
+                        if group_clean:
+                            base_name = f"{base_name} ({group_clean})"
+                    else:
+                        base_name = f"{base_name} ({group_part})"
             else:
                 # Если нет разделителя, берем последние 10 символов
                 group_short = group_info[-10:] if len(group_info) > 10 else group_info
