@@ -292,10 +292,51 @@ def update_vedomosti_status_by_payment(payment_id: str, status: str, reason: str
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        state_val = f"imported:{payment_id}"
         now = int(time.time())
+        
+        # Обрабатываем новый формат unique_payment_id (original_payment_id_db_id)
+        if '_' in payment_id:
+            try:
+                db_id = int(payment_id.split('_')[-1])
+                # Ищем по db_id (более точно)
+                c.execute("SELECT id, vk_id, original_filename, state FROM vedomosti_users WHERE id = ?", (db_id,))
+                existing_record = c.fetchone()
+                
+                if existing_record:
+                    log.info("Found record by db_id for payment_id=%s: db_id=%s vk_id=%s filename=%s state=%s", 
+                            payment_id, existing_record[0], existing_record[1], existing_record[2], existing_record[3])
+                    
+                    # Обновляем по db_id
+                    if reason is not None:
+                        c.execute(
+                            "UPDATE vedomosti_users SET status = ?, disagree_reason = ?, confirmed_at = ? WHERE id = ?",
+                            (status, str(reason), now, db_id)
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE vedomosti_users SET status = ?, confirmed_at = ? WHERE id = ?",
+                            (status, now, db_id)
+                        )
+                    conn.commit()
+                    affected = c.rowcount
+                    conn.close()
+                    log.info("Updated vedomosti_users by db_id for payment=%s -> status=%s reason=%s affected=%s", payment_id, status, reason, affected)
+                    
+                    # Обновляем и в памяти
+                    update_payment_in_memory(payment_id, status, reason)
+                    return
+                    
+            except (ValueError, IndexError):
+                # Если не удалось извлечь db_id, используем старый способ
+                pass
+        
+        # Старый способ поиска по state (fallback)
+        original_payment_id = payment_id.split('_')[0] if '_' in payment_id else payment_id
+        state_val = f"imported:{original_payment_id}"
+        
         c.execute("SELECT id, vk_id, original_filename FROM vedomosti_users WHERE state = ?", (state_val,))
         existing_record = c.fetchone()
+        
         if not existing_record:
             log.error("No record found for payment_id=%s with state=%s", payment_id, state_val)
             conn.close()
@@ -318,16 +359,28 @@ def update_vedomosti_status_by_payment(payment_id: str, status: str, reason: str
         affected = c.rowcount
         conn.close()
         log.info("Updated vedomosti_users for payment=%s -> status=%s reason=%s affected=%s", payment_id, status, reason, affected)
+        
+        # Обновляем в памяти
+        update_payment_in_memory(payment_id, status, reason)
+        
+    except Exception:
+        log.exception("Failed to update vedomosti status for payment %s", payment_id)
+
+
+def update_payment_in_memory(payment_id: str, status: str, reason: str = None):
+    """Обновляет статус платежа в памяти."""
+    try:
         for user_id, payments in user_payments.items():
             for payment in payments:
-                if payment["id"] == payment_id:
+                # Проверяем и исходный payment_id и уникальный
+                if payment["id"] == payment_id or payment.get("original_payment_id") == payment_id:
                     payment["status"] = status
                     if reason is not None:
                         payment["disagree_reason"] = reason
                     log.info("Updated payment %s status to %s in memory for user %s", payment_id, status, user_id)
                     break
     except Exception:
-        log.exception("Failed to update vedomosti status for payment %s", payment_id)
+        log.exception("Failed to update payment in memory for payment_id %s", payment_id)
 
 def fetch_unprocessed_vedomosti():
     rows = []
@@ -1105,15 +1158,29 @@ def _to_float_str_money(value) -> str:
     except Exception:
         return '0'
 
-def _format_payment_label(original_filename: str, idx: int, max_length: int = 30) -> str:
+def _format_payment_label(original_filename: str, idx: int, max_length: int = 30, created_at: float = None, db_id: int = None) -> str:
     """Форматирует название выплаты для кнопки, убирая расширение .csv и ограничивая длину"""
     if original_filename:
         # Убираем расширение .csv
         base_name = os.path.splitext(original_filename)[0]
+        
+        # Если есть временная метка, добавляем её для различия одинаковых ведомостей
+        if created_at and db_id:
+            import time
+            try:
+                # Форматируем дату как день/месяц
+                date_str = time.strftime('%d.%m', time.localtime(created_at))
+                full_label = f"{base_name} ({date_str})"
+            except Exception:
+                # Fallback - используем db_id
+                full_label = f"{base_name} #{db_id}"
+        else:
+            full_label = base_name
+        
         # Ограничиваем длину
-        if len(base_name) > max_length:
-            return base_name[:max_length-3] + "..."
-        return base_name
+        if len(full_label) > max_length:
+            return full_label[:max_length-3] + "..."
+        return full_label
     else:
         return f"Ведомость {idx}"
 
@@ -1249,7 +1316,10 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                 
                 payment_id = parts[1]
                 
-                # Сначала проверяем, есть ли эта ведомость в памяти (более свежие данные)
+                # Создаем уникальный payment_id на основе db_id для старых записей с дублирующимися payment_id
+                unique_payment_id = f"{payment_id}_{db_id}" if payment_id else f"payment_{db_id}"
+                
+                # Сначала проверяем, есть ли эта ведомость в памяти (по исходному payment_id)
                 memory_payment = None
                 with user_payments_lock:
                     for p in user_payments.get(user_id, []):
@@ -1258,8 +1328,11 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                             break
                 
                 if memory_payment:
-                    # Используем данные из памяти (более актуальные)
-                    payments.append(memory_payment)
+                    # Используем данные из памяти но с уникальным ID
+                    memory_copy = memory_payment.copy()
+                    memory_copy["id"] = unique_payment_id
+                    memory_copy["db_id"] = db_id  # Сохраняем db_id для отладки
+                    payments.append(memory_copy)
                 else:
                     # Загружаем из CSV файла
                     row_dict = {}
@@ -1269,15 +1342,17 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                             if isinstance(df, pd.DataFrame) and not df.empty:
                                 row_dict = df.iloc[0].to_dict()
                         except Exception:
-                            log.warning("Failed to read CSV for payment %s path=%s", payment_id, personal_path)
+                            log.warning("Failed to read CSV for payment %s path=%s", unique_payment_id, personal_path)
                     
                     payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
                     
                     entry = {
-                        "id": payment_id,
+                        "id": unique_payment_id,
                         "data": payment_data,
                         "created_at": float(created_at_db) if created_at_db else time.time(),
                         "status": status_db or "new",
+                        "db_id": db_id,  # Сохраняем db_id для отладки
+                        "original_payment_id": payment_id  # Сохраняем исходный payment_id
                     }
                     
                     if disagree_reason_db:
@@ -1307,14 +1382,36 @@ def find_payment(user_id: int, payment_id: str):
     try:
         if not os.path.exists(DB_PATH):
             return None
-            
+        
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        c.execute("""
-            SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
-            FROM vedomosti_users 
-            WHERE vk_id = ? AND state = ?
-        """, (str(user_id), f"imported:{payment_id}"))
+        
+        # Сначала пробуем найти по полному уникальному payment_id (новый формат)
+        if '_' in payment_id:
+            # Извлекаем db_id из уникального payment_id
+            try:
+                db_id = int(payment_id.split('_')[-1])
+                c.execute("""
+                    SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+                    FROM vedomosti_users 
+                    WHERE id = ? AND vk_id = ?
+                """, (db_id, str(user_id)))
+            except ValueError:
+                # Если не удалось извлечь db_id, пробуем старый способ
+                c.execute("""
+                    SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+                    FROM vedomosti_users 
+                    WHERE vk_id = ? AND state = ?
+                """, (str(user_id), f"imported:{payment_id}"))
+        else:
+            # Старый формат payment_id
+            c.execute("""
+                SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
+                FROM vedomosti_users 
+                WHERE vk_id = ? AND state = ?
+                LIMIT 1
+            """, (str(user_id), f"imported:{payment_id}"))
+        
         row = c.fetchone()
         conn.close()
         
@@ -1335,11 +1432,17 @@ def find_payment(user_id: int, payment_id: str):
         
         payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
         
+        # Используем уникальный payment_id
+        original_payment_id = state.split(':', 1)[1] if ':' in state else payment_id
+        unique_payment_id = f"{original_payment_id}_{db_id}"
+        
         entry = {
-            "id": payment_id,
+            "id": unique_payment_id,
             "data": payment_data,
             "created_at": float(created_at_db) if created_at_db else time.time(),
             "status": status_db or "new",
+            "db_id": db_id,
+            "original_payment_id": original_payment_id
         }
         
         if disagree_reason_db:
