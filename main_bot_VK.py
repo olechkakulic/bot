@@ -31,7 +31,7 @@ def total_payments_count():
     with user_payments_lock:
         return sum(len(payments) for payments in user_payments.values())
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
