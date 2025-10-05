@@ -592,14 +592,26 @@ def notify_command(update: Update, context: CallbackContext):
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
         
+        # Нормализуем название для поиска (заменяем пробелы на подчеркивания)
+        subject_normalized = subject.replace(' ', '_')
+        
         # Пробуем точное совпадение сначала
-        c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename = ?', (subject + '.csv',))
+        c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename = ?', (subject_normalized + '.csv',))
         rows = c.fetchall()
         
-        # Если точного совпадения нет, пробуем поиск по подстроке
+        # Если точного совпадения нет, пробуем гибкий поиск
         if not rows:
-            c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename LIKE ?', ('%' + subject + '%',))
+            # Создаем паттерн который игнорирует различия между пробелами и подчеркиваниями
+            # Заменяем каждый пробел и подчеркивание на паттерн [_ ]
+            flexible_pattern = subject.replace(' ', '[_ ]').replace('_', '[_ ]')
+            c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename REGEXP ?', (flexible_pattern,))
             rows = c.fetchall()
+            
+            # Если REGEXP не работает (не все SQLite поддерживают), используем LIKE с нормализацией
+            if not rows:
+                c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE REPLACE(original_filename, "_", " ") LIKE ?', 
+                         ('%' + subject.replace('_', ' ') + '%',))
+                rows = c.fetchall()
         
         conn.close()
     except Exception:
@@ -613,11 +625,11 @@ def notify_command(update: Update, context: CallbackContext):
     total = len(vk_ids)
     
     if total == 0:
-        update.message.reply_text(f'❌ Не найдено пользователей для ведомости "{subject}".\nПроверьте правильность названия ведомости.')
+        update.message.reply_text(f'Не найдено пользователей для ведомости "{subject}".\nПроверьте правильность названия ведомости.')
         return
     
     # Сообщаем сколько пользователей найдено
-    update.message.reply_text(f'📤 Начинаю рассылку для ведомости "{subject}".\nНайдено пользователей: {total}')
+    update.message.reply_text(f'Начинаю рассылку для ведомости "{subject}".\nНайдено пользователей: {total}')
     
     sent = 0
     failed = 0
