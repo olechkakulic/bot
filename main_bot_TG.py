@@ -510,11 +510,13 @@ def start(update: Update, context: CallbackContext):
         '1) Пришли файл (CSV/XLSX) как вложение.\n'
         '2) Отправь команду:\n'
         '/send <предмет> <тип курса> <блок>\n\n'
-        'Также админы могут вызвать /notify чтобы разослать уведомления по vk_id из БД.\n\n'
-        'Пример:\n'
-        '/send Русский ОГЭ ПГК 1\n'
-        '3) После того как ведомость опубликована, вы можете разослать уведомления участникам'
-    'по vk_id командой /notify (например: /notify Пожалуйста, проверьте новую ведомость).\n\n'
+        'Также админы могут использовать:\n'
+        '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n\n'
+        'Примеры:\n'
+        '/send Русский ОГЭ ПГК\n'
+        '/notify Русский ОГЭ ПГК\n\n'
+        '3) После публикации ведомости можно разослать уведомления участникам'
+    'по vk_id командой /notify <название ведомости>.\n\n'
     )
 
 def description(update: Update, context: CallbackContext):
@@ -580,7 +582,7 @@ def notify_command(update: Update, context: CallbackContext):
 
     # Получаем название ведомости, если оно указано
     if context.args:
-        subject = context.args[0].strip()
+        subject = ' '.join(context.args).strip()  # Объединяем все аргументы в одну строку
     else:
         update.message.reply_text('Не указано название ведомости.')
         return
@@ -589,8 +591,16 @@ def notify_command(update: Update, context: CallbackContext):
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename LIKE ?', ('%' + subject + '%',))
+        
+        # Пробуем точное совпадение сначала
+        c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename = ?', (subject + '.csv',))
         rows = c.fetchall()
+        
+        # Если точного совпадения нет, пробуем поиск по подстроке
+        if not rows:
+            c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename LIKE ?', ('%' + subject + '%',))
+            rows = c.fetchall()
+        
         conn.close()
     except Exception:
         log.exception('Failed to read vedomosti_users for notify')
@@ -601,6 +611,14 @@ def notify_command(update: Update, context: CallbackContext):
     vk_ids = list(dict.fromkeys(vk_ids))  # unique preserving order
 
     total = len(vk_ids)
+    
+    if total == 0:
+        update.message.reply_text(f'❌ Не найдено пользователей для ведомости "{subject}".\nПроверьте правильность названия ведомости.')
+        return
+    
+    # Сообщаем сколько пользователей найдено
+    update.message.reply_text(f'📤 Начинаю рассылку для ведомости "{subject}".\nНайдено пользователей: {total}')
+    
     sent = 0
     failed = 0
     failed_list = []
