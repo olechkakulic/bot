@@ -506,23 +506,33 @@ def start(update: Update, context: CallbackContext):
 
     update.message.reply_text(
         'Привет! Это бот для отправки файлов на хостинг.\n\n'
-        'Сценарий работы:\n'
-        '1) Пришли файл (CSV/XLSX) как вложение.\n'
+        'Сценарий работы:\n\n'
+        '1) Пришли файл XLSX как вложение.\n'
         '2) Отправь команду:\n'
-        '/send <предмет> <тип курса> <блок>\n\n'
-        'Также админы могут вызвать /notify чтобы разослать уведомления по vk_id из БД.\n\n'
-        'Пример:\n'
-        '/send Русский ОГЭ ПГК 1\n'
-        '3) После того как ведомость опубликована, вы можете разослать уведомления участникам'
-    'по vk_id командой /notify (например: /notify Пожалуйста, проверьте новую ведомость).\n\n'
+        '/send <предмет> <тип курса> <блок>\n'
+        'Пример: /send Русский ОГЭ ПГК\n'
+        '3) После публикации ведомости можно разослать уведомления участникам по vk_id командой /notify <название ведомости>.\n'
+        'Пример: /notify Русский ОГЭ ПГК\n\n'
+        'Команды для админов:\n'
+        '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
+        '/liststatements — показать список всех открытых и архивных ведомостей\n'
+        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК.\n'
     )
 
 def description(update: Update, context: CallbackContext):
     update.message.reply_text(
-        'Загрузи файл (CSV/XLSX) как вложение, затем выполни:\n'
-        '/send <предмет> <тип курса> <блок>\n\n'
-        'Пример:\n'
-        '/send Русский ОГЭ ПГК 1'
+        'Привет! Это бот для отправки файлов на хостинг.\n\n'
+        'Сценарий работы:\n\n'
+        '1) Пришли файл XLSX как вложение.\n'
+        '2) Отправь команду:\n'
+        '/send <предмет> <тип курса> <блок>\n'
+        'Пример: /send Русский ОГЭ ПГК\n'
+        '3) После публикации ведомости можно разослать уведомления участникам по vk_id командой /notify <название ведомости>.\n'
+        'Пример: /notify Русский ОГЭ ПГК\n\n'
+        'Команды для админов:\n'
+        '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
+        '/liststatements — показать список всех открытых и архивных ведомостей\n'
+        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК.\n'
     )
 
 def handle_document(update: Update, context: CallbackContext):
@@ -570,9 +580,6 @@ def handle_document(update: Update, context: CallbackContext):
 
 
 def notify_command(update: Update, context: CallbackContext):
-    """Команда /notify — рассылка уведомлений участникам последней ведомости.
-    При каждом уведомлении прикрепляем не-inline кнопку 'К списку выплат' (payload -> {"cmd":"to_list"}).
-    """
     user = update.message.from_user
     if not is_admin(user.id):
         update.message.reply_text('Только админы могут отправлять рассылки.')
@@ -580,17 +587,30 @@ def notify_command(update: Update, context: CallbackContext):
 
     # Получаем название ведомости, если оно указано
     if context.args:
-        subject = context.args[0].strip()
+        subject = ' '.join(context.args).strip()  # Объединяем все аргументы в одну строку
     else:
         update.message.reply_text('Не указано название ведомости.')
         return
 
-    # Получаем vk_id участников только этой ведомости
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename LIKE ?', ('%' + subject + '%',))
+        
+        subject_normalized = subject.replace(' ', '_')
+        
+        c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename = ?', (subject_normalized + '.csv',))
         rows = c.fetchall()
+        
+        if not rows:
+            flexible_pattern = subject.replace(' ', '[_ ]').replace('_', '[_ ]')
+            c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE original_filename REGEXP ?', (flexible_pattern,))
+            rows = c.fetchall()
+            
+            if not rows:
+                c.execute('SELECT DISTINCT vk_id FROM vedomosti_users WHERE REPLACE(original_filename, "_", " ") LIKE ?', 
+                         ('%' + subject.replace('_', ' ') + '%',))
+                rows = c.fetchall()
+        
         conn.close()
     except Exception:
         log.exception('Failed to read vedomosti_users for notify')
@@ -601,6 +621,14 @@ def notify_command(update: Update, context: CallbackContext):
     vk_ids = list(dict.fromkeys(vk_ids))  # unique preserving order
 
     total = len(vk_ids)
+    
+    if total == 0:
+        update.message.reply_text(f'Не найдено пользователей для ведомости "{subject}".\nПроверьте правильность названия ведомости.')
+        return
+    
+    # Сообщаем сколько пользователей найдено
+    update.message.reply_text(f'Начинаю рассылку для ведомости "{subject}".\nНайдено пользователей: {total}')
+    
     sent = 0
     failed = 0
     failed_list = []
@@ -948,19 +976,277 @@ def listadmins_command(update: Update, context: CallbackContext):
     text = 'Текущий список админов:\n' + '\n'.join(lines)
     msg.reply_text(text)
 
+def liststatements_command(update: Update, context: CallbackContext):
+    """Команда /liststatements — показывает все открытые и архивные ведомости."""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /liststatements from non-admin %s', from_id)
+        msg.reply_text('Только админы могут просматривать список ведомостей.')
+        return
+
+    try:
+        # Собираем открытые ведомости из папок
+        open_statements = []
+        open_path = os.path.join(HOSTING_ROOT, OPEN_DIRNAME)
+        
+        if os.path.exists(open_path):
+            # Проходим по всем папкам и ищем CSV файлы (не в папке users)
+            for root, dirs, files in os.walk(open_path):
+                # Пропускаем папку users
+                if 'users' in root:
+                    continue
+                    
+                for file in files:
+                    if file.endswith('.csv'):
+                        file_path = os.path.join(root, file)
+                        # Получаем время архивации из БД
+                        archive_time = get_archive_time_for_file(file)
+                        open_statements.append({
+                            'name': file,
+                            'path': file_path,
+                            'archive_at': archive_time
+                        })
+
+        # Собираем архивные ведомости из папок
+        archive_statements = []
+        archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+        
+        if os.path.exists(archive_path):
+            for root, dirs, files in os.walk(archive_path):
+                # Пропускаем папку users
+                if 'users' in root:
+                    continue
+                    
+                for file in files:
+                    if file.endswith('.csv'):
+                        archive_statements.append(file)
+
+        # Формируем ответ
+        response_lines = []
+        
+        # Открытые ведомости
+        response_lines.append('ОТКРЫТЫЕ ВЕДОМОСТИ:')
+        if open_statements:
+            for stmt in open_statements:
+                name = stmt['name']
+                archive_at = stmt['archive_at']
+                
+                if archive_at and archive_at > 0:
+                    now = int(time.time())
+                    hours_left = max(0, (archive_at - now) // 3600)
+                    if hours_left > 0:
+                        response_lines.append(f'  • {name} (архивация через {hours_left}ч)')
+                    else:
+                        response_lines.append(f'  • {name} (готова к архивации)')
+                else:
+                    response_lines.append(f'  • {name} (время архивации не установлено)')
+        else:
+            response_lines.append('  (нет открытых ведомостей)')
+        
+        response_lines.append('')
+        
+        # Архивные ведомости
+        response_lines.append('АРХИВНЫЕ ВЕДОМОСТИ:')
+        if archive_statements:
+            for name in sorted(archive_statements):
+                response_lines.append(f'  • {name}')
+        else:
+            response_lines.append('  (нет архивных ведомостей)')
+        
+        response = '\n'.join(response_lines)
+        
+        # Telegram ограничивает длину сообщений
+        if len(response) > 4000:
+            response = response[:4000] + '\n...(список обрезан)'
+        
+        msg.reply_text(response)
+        
+    except Exception as e:
+        log.exception('Error in liststatements_command')
+        msg.reply_text(f'Ошибка при получении списка ведомостей: {str(e)}')
+
+
+def get_archive_time_for_file(filename: str) -> int:
+    """Получает время архивации для файла из БД."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute('SELECT archive_at FROM vedomosti_users WHERE original_filename = ? LIMIT 1', (filename,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row and row[0]:
+            return int(row[0])
+        return 0
+    except Exception:
+        log.exception('Failed to get archive time for file %s', filename)
+        return 0
+
+
 def archive_command(update: Update, context: CallbackContext):
-    """Команда для ручной архивации ведомостей (только для админов)."""
-    if not is_admin(update.effective_user.id):
-        update.message.reply_text('Эта команда доступна только администраторам.')
+    """Команда для ручной архивации конкретной ведомости: /archive <название ведомости>"""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /archive from non-admin %s', from_id)
+        msg.reply_text('Только админы могут архивировать ведомости.')
+        return
+
+    # Получаем название ведомости
+    if not context.args:
+        msg.reply_text(
+            'Укажите название ведомости для архивации.\n'
+            'Использование: /archive <название ведомости>\n'
+            'Пример: /archive Русский ОГЭ ПГК\n\n'
+            'Для просмотра доступных ведомостей используйте /liststatements'
+        )
         return
     
+    statement_name = ' '.join(context.args).strip()
+    
     try:
-        # Запускаем архивацию
-        process_archive()
-        update.message.reply_text('Архивация выполнена. Проверьте логи для подробностей.')
+        # Нормализуем название (как в notify_command)
+        statement_normalized = statement_name.replace(' ', '_')
+        target_filename = statement_normalized + '.csv'
+        
+        # Ищем ведомость в открытых папках
+        statement_folder = find_statement_folder(target_filename)
+        if not statement_folder:
+            # Пробуем гибкий поиск
+            statement_folder = find_statement_folder_flexible(statement_name)
+            if statement_folder:
+                target_filename = os.path.basename([f for f in os.listdir(statement_folder) if f.endswith('.csv')][0])
+        
+        if not statement_folder:
+            msg.reply_text(f'Ведомость "{statement_name}" не найдена в открытых папках.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
+            return
+        
+        # Проверяем есть ли пользователи этой ведомости в БД
+        users_count = count_users_in_statement(target_filename)
+        
+        msg.reply_text(f'Начинаю архивацию ведомости "{statement_name}".\nНайдено пользователей в БД: {users_count}')
+        
+        # Выполняем архивацию
+        success = archive_statement_manually(target_filename, statement_folder)
+        
+        if success:
+            # Удаляем пользователей из БД
+            removed_count = remove_users_from_statement(target_filename)
+            msg.reply_text(
+                f'Ведомость "{statement_name}" успешно заархивирована.\n'
+                f'Папка перемещена в архив.\n'
+                f'Удалено записей из БД: {removed_count}'
+            )
+        else:
+            msg.reply_text(f'Ошибка при архивации ведомости "{statement_name}". Проверьте логи.')
+            
     except Exception as e:
         log.exception('Error in manual archive command')
-        update.message.reply_text(f'Ошибка при архивации: {str(e)}')
+        msg.reply_text(f'Ошибка при архивации: {str(e)}')
+
+
+def find_statement_folder(filename: str) -> str:
+    """Находит папку содержащую указанный файл ведомости."""
+    open_path = os.path.join(HOSTING_ROOT, OPEN_DIRNAME)
+    
+    if not os.path.exists(open_path):
+        return None
+    
+    for root, dirs, files in os.walk(open_path):
+        # Пропускаем папки users
+        if 'users' in root:
+            continue
+        
+        if filename in files:
+            return root
+    
+    return None
+
+
+def find_statement_folder_flexible(statement_name: str) -> str:
+    """Гибкий поиск папки ведомости (игнорирует различия пробелов и подчеркиваний)."""
+    open_path = os.path.join(HOSTING_ROOT, OPEN_DIRNAME)
+    
+    if not os.path.exists(open_path):
+        return None
+    
+    # Нормализуем искомое название
+    normalized_search = statement_name.replace(' ', '_').replace('_', ' ').lower()
+    
+    for root, dirs, files in os.walk(open_path):
+        if 'users' in root:
+            continue
+        
+        for file in files:
+            if file.endswith('.csv'):
+                # Нормализуем найденное название
+                file_normalized = file.replace('.csv', '').replace('_', ' ').lower()
+                
+                if normalized_search in file_normalized or file_normalized in normalized_search:
+                    return root
+    
+    return None
+
+
+def count_users_in_statement(filename: str) -> int:
+    """Подсчитывает количество пользователей ведомости в БД."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM vedomosti_users WHERE original_filename = ?', (filename,))
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        log.exception('Failed to count users for statement %s', filename)
+        return 0
+
+
+def archive_statement_manually(filename: str, statement_folder: str) -> bool:
+    """Архивирует ведомость вручную (перемещает всю папку в архив)."""
+    try:
+        archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+        open_path = os.path.join(HOSTING_ROOT, OPEN_DIRNAME)
+        
+        # Создаем структуру архива
+        os.makedirs(archive_path, exist_ok=True)
+        
+        # Определяем относительный путь от open до папки с ведомостью
+        relative_path = os.path.relpath(statement_folder, open_path)
+        archive_folder = os.path.join(archive_path, relative_path)
+        
+        # Создаем родительские папки в архиве
+        os.makedirs(os.path.dirname(archive_folder), exist_ok=True)
+        
+        # Перемещаем всю папку с ведомостью в архив
+        if os.path.exists(statement_folder):
+            shutil.move(statement_folder, archive_folder)
+            log.info('Manually moved statement folder to archive: %s -> %s', statement_folder, archive_folder)
+            return True
+        else:
+            log.warning('Statement folder not found: %s', statement_folder)
+            return False
+            
+    except Exception:
+        log.exception('Failed to manually archive statement %s from folder %s', filename, statement_folder)
+        return False
+
+
+def remove_users_from_statement(filename: str) -> int:
+    """Удаляет всех пользователей указанной ведомости из БД."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute('DELETE FROM vedomosti_users WHERE original_filename = ?', (filename,))
+        affected = c.rowcount
+        conn.commit()
+        conn.close()
+        log.info('Removed %d users for statement %s from database', affected, filename)
+        return affected
+    except Exception:
+        log.exception('Failed to remove users from DB for statement %s', filename)
+        return 0
 
 def unknown(update: Update, context: CallbackContext):
     update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок>.')
@@ -1175,14 +1461,15 @@ def run_bot():
 
     try:
         commands = [
-            BotCommand('start', 'Показать инструкцию по использованию бота'),
+            BotCommand('start', 'Знакомство'),
             BotCommand('description', 'Показать описание процесса загрузки'),
             BotCommand('send', 'Отправить файл на хостинг: /send <предмет> <тип курса> <блок>'),
-            BotCommand('notify', 'Разослать уведомление vk_id из БД (admin only)'),
+            BotCommand('notify', 'Разослать уведомление vk_id из БД'),
+            BotCommand('liststatements', 'Показать список открытых и архивных ведомостей'),
             BotCommand('addadmin', 'Добавить админа: /addadmin <username_or_id>'),
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
-            BotCommand('archive', 'Ручная архивация ведомостей (admin only)')
+            BotCommand('archive', 'Переместить ведомость в архив: /archive <название>')
         ]
         updater.bot.set_my_commands(commands)
         log.info('Bot commands (menu) set: %s', [c.command for c in commands])
@@ -1193,6 +1480,7 @@ def run_bot():
     dp.add_handler(CommandHandler('description', description))
     dp.add_handler(CommandHandler('send', send_command))
     dp.add_handler(CommandHandler('notify', notify_command))
+    dp.add_handler(CommandHandler('liststatements', liststatements_command))
     dp.add_handler(CommandHandler('addadmin', addadmin_command))
     dp.add_handler(CommandHandler('deladmin', deladmin_command))
     dp.add_handler(CommandHandler('listadmins', listadmins_command))
@@ -1206,4 +1494,3 @@ def run_bot():
 
 if __name__ == '__main__':
     run_bot()
-
