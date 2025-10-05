@@ -759,12 +759,24 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
         if status == "agreed":
             # Оставляем место для " " (3 символа) 
             max_label_length = 37
-            base_label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx, max_label_length)
+            base_label = _format_payment_label(
+                entry.get("data", {}).get('original_filename'), 
+                idx, 
+                max_label_length,
+                entry.get("created_at"),
+                entry.get("db_id")
+            )
             button_label = f"{base_label} "
             button_color = "positive"
         else:
             # Полная длина для обычных кнопок
-            base_label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx, 40)
+            base_label = _format_payment_label(
+                entry.get("data", {}).get('original_filename'), 
+                idx, 
+                40,
+                entry.get("created_at"),
+                entry.get("db_id")
+            )
             button_label = base_label
             button_color = "primary"
             
@@ -1693,6 +1705,9 @@ def handle_message_event(event):
                     return
                 
                 statement_text = "Открыта ведомость \n\n" + format_payment_text(p["data"])
+                # Добавляем информацию о записи для различения одинаковых ведомостей
+                if p.get("db_id"):
+                    statement_text += f"\n\n[ID записи: {p.get('db_id')}]"
                 safe_vk_send(user_id, statement_text, inline_confirm_keyboard(payment_id=sid))
                 user_last_opened_payment[user_id] = sid  # Запоминаем последнюю открытую выплату
                 log.info("User %s opened statement %s (unique_payment_id=%s)", user_id, sid, sid)
@@ -1785,6 +1800,9 @@ def handle_message_new(event):
                         return
                     
                     statement_text = "Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
+                    # Добавляем информацию о записи для различения одинаковых ведомостей
+                    if p.get("db_id"):
+                        statement_text += f"\n\n[ID записи: {p.get('db_id')}]"
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
@@ -1933,7 +1951,13 @@ def handle_message_new(event):
                     return
                 statements = []
                 for idx, p in enumerate(payments, start=1):
-                    label = _format_payment_label(p["data"].get('original_filename'), idx)
+                    label = _format_payment_label(
+                        p["data"].get('original_filename'), 
+                        idx,
+                        30,
+                        p.get("created_at"),
+                        p.get("db_id")
+                    )
                     statements.append((p["id"], label))
                 vk.messages.send(
                     user_id=from_id,
@@ -1951,7 +1975,13 @@ def handle_message_new(event):
                     return
                 statements = []
                 for idx, p in enumerate(payments, start=1):
-                    label = _format_payment_label(p["data"].get('original_filename'), idx)
+                    label = _format_payment_label(
+                        p["data"].get('original_filename'), 
+                        idx,
+                        30,
+                        p.get("created_at"),
+                        p.get("db_id")
+                    )
                     statements.append((p["id"], label))
                 vk.messages.send(
                     user_id=from_id,
