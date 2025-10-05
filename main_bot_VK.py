@@ -893,16 +893,24 @@ def format_payment_text(data: dict) -> str:
         vk_id_str = str(data.get('vk_id','')).strip()
         original_filename = data.get('original_filename') or ''
         
-        if not vk_id_str or not original_filename:
-            return format_payment_text_fallback(data)
-        
-        # Получаем base_name для поиска CSV файла
-        base_name = os.path.splitext(original_filename)[0] if original_filename else ''
-        
-        # Ищем CSV файл
-        csv_path = _find_curator_csv(base_name, int(vk_id_str))
-        if not csv_path:
-            return format_payment_text_fallback(data)
+        # ИСПРАВЛЕНИЕ: Используем конкретный путь к файлу, если он есть в данных
+        personal_path = data.get('personal_path')
+        if personal_path and os.path.exists(personal_path):
+            # Загружаем данные из конкретного персонального файла
+            csv_path = personal_path
+            log.debug("Using specific personal_path for format_payment_text: %s", csv_path)
+        else:
+            # Fallback на старый метод поиска (для совместимости)
+            if not vk_id_str or not original_filename:
+                return format_payment_text_fallback(data)
+            
+            # Получаем base_name для поиска CSV файла
+            base_name = os.path.splitext(original_filename)[0] if original_filename else ''
+            
+            # Ищем CSV файл
+            csv_path = _find_curator_csv(base_name, int(vk_id_str))
+            if not csv_path:
+                return format_payment_text_fallback(data)
         
         # Читаем CSV
         try:
@@ -928,8 +936,7 @@ def format_payment_text(data: dict) -> str:
                 f"\nВедомость: {original_filename.replace('.csv', '')}"
                 f"\nКуратор: {p.get('name', '')}"
                 f"\nТип куратора: {p.get('type', '')}"
-                f"\nПочта на платформе: {p.get('email', '')}"
-                f"\nГруппы куратора: {p.get('groups', '')}\n")
+                f"\nПочта на платформе: {p.get('email', '')}\n")
 
         studs_section = ""
         stud_all = _to_int_safe(p.get('stud_all'))
@@ -1237,8 +1244,7 @@ def format_message(file_name, uid, course_type, deadline):
             f"\nКурс: {course_type}"
             f"\nКуратор: {p.get('name','')}"
             f"\nТип куратора: {p.get('type','')}"
-            f"\nПочта на платформе: {p.get('email','')}"
-            f"\nГруппы куратора: {p.get('groups','')}\n")
+            f"\nПочта на платформе: {p.get('email','')}\n")
 
     studs_section = ""
     stud_all = _to_int_safe(p.get('stud_all'))
@@ -1367,6 +1373,10 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                 
                 payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
                 
+                # ВАЖНО: Добавляем personal_path в данные, чтобы format_payment_text 
+                # знала из какого именно файла загружать данные
+                payment_data['personal_path'] = personal_path
+                
                 entry = {
                     "id": unique_payment_id,
                     "data": payment_data,
@@ -1456,6 +1466,9 @@ def find_payment(user_id: int, payment_id: str):
                 log.warning("Failed to read CSV for find_payment %s path=%s", payment_id, personal_path)
         
         payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+        
+        # ВАЖНО: Добавляем personal_path в данные для правильного отображения
+        payment_data['personal_path'] = personal_path
         
         # Используем уникальный payment_id
         original_payment_id = state.split(':', 1)[1] if ':' in state else payment_id
@@ -1705,9 +1718,6 @@ def handle_message_event(event):
                     return
                 
                 statement_text = "Открыта ведомость \n\n" + format_payment_text(p["data"])
-                # Добавляем информацию о записи для различения одинаковых ведомостей
-                if p.get("db_id"):
-                    statement_text += f"\n\n[ID записи: {p.get('db_id')}]"
                 safe_vk_send(user_id, statement_text, inline_confirm_keyboard(payment_id=sid))
                 user_last_opened_payment[user_id] = sid  # Запоминаем последнюю открытую выплату
                 log.info("User %s opened statement %s (unique_payment_id=%s)", user_id, sid, sid)
@@ -1800,9 +1810,6 @@ def handle_message_new(event):
                         return
                     
                     statement_text = "Открыта ведомость 📋\n\n" + format_payment_text(p["data"])
-                    # Добавляем информацию о записи для различения одинаковых ведомостей
-                    if p.get("db_id"):
-                        statement_text += f"\n\n[ID записи: {p.get('db_id')}]"
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
