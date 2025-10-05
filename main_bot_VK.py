@@ -764,7 +764,8 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
                 idx, 
                 max_label_length,
                 entry.get("created_at"),
-                entry.get("db_id")
+                entry.get("db_id"),
+                entry.get("data", {}).get("groups")  # Передаем информацию о группах
             )
             button_label = f"{base_label} "
             button_color = "positive"
@@ -775,7 +776,8 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
                 idx, 
                 40,
                 entry.get("created_at"),
-                entry.get("db_id")
+                entry.get("db_id"),
+                entry.get("data", {}).get("groups")  # Передаем информацию о группах
             )
             button_label = base_label
             button_color = "primary"
@@ -1176,29 +1178,41 @@ def _to_float_str_money(value) -> str:
     except Exception:
         return '0'
 
-def _format_payment_label(original_filename: str, idx: int, max_length: int = 30, created_at: float = None, db_id: int = None) -> str:
+def _format_payment_label(original_filename: str, idx: int, max_length: int = 30, created_at: float = None, db_id: int = None, groups: str = None) -> str:
     """Форматирует название выплаты для кнопки, убирая расширение .csv и ограничивая длину"""
     if original_filename:
         # Убираем расширение .csv
         base_name = os.path.splitext(original_filename)[0]
         
-        # Если есть временная метка, добавляем её для различия одинаковых ведомостей
-        if created_at and db_id:
+        # Добавляем информацию о группах для различения
+        if groups and groups.strip():
+            # Извлекаем краткое название группы (например "Группа 1" из "Аня Колотович | Группа 1")
+            group_info = groups.strip()
+            if '|' in group_info:
+                group_part = group_info.split('|')[-1].strip()
+                if group_part:
+                    base_name = f"{base_name} ({group_part})"
+            else:
+                # Если нет разделителя, берем последние 10 символов
+                group_short = group_info[-10:] if len(group_info) > 10 else group_info
+                base_name = f"{base_name} ({group_short})"
+        
+        # Если есть временная метка, добавляем её для дополнительного различия
+        elif created_at and db_id:
             import time
             try:
                 # Форматируем дату как день/месяц
                 date_str = time.strftime('%d.%m', time.localtime(created_at))
-                full_label = f"{base_name} ({date_str})"
+                base_name = f"{base_name} ({date_str})"
             except Exception:
                 # Fallback - используем db_id
-                full_label = f"{base_name} #{db_id}"
-        else:
-            full_label = base_name
+                base_name = f"{base_name} #{db_id}"
         
         # Ограничиваем длину
-        if len(full_label) > max_length:
-            return full_label[:max_length-3] + "..."
-        return full_label
+        if len(base_name) > max_length:
+            base_name = base_name[:max_length-3] + "..."
+            
+        return base_name
     else:
         return f"Ведомость {idx}"
 
@@ -1337,49 +1351,35 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                 # Создаем уникальный payment_id на основе db_id для старых записей с дублирующимися payment_id
                 unique_payment_id = f"{payment_id}_{db_id}" if payment_id else f"payment_{db_id}"
                 
-                # Сначала проверяем, есть ли эта ведомость в памяти (по исходному payment_id)
-                # НО только для той же записи БД (чтобы избежать дублирования разных ведомостей)
-                memory_payment = None
-                with user_payments_lock:
-                    for p in user_payments.get(user_id, []):
-                        # Проверяем и исходный payment_id И что это та же запись БД
-                        if p["id"] == payment_id and p.get("db_id") == db_id:
-                            memory_payment = p
-                            break
-                
-                if memory_payment:
-                    # Используем данные из памяти но с уникальным ID
-                    memory_copy = memory_payment.copy()
-                    memory_copy["id"] = unique_payment_id
-                    memory_copy["db_id"] = db_id  # Сохраняем db_id для отладки
-                    payments.append(memory_copy)
-                    log.debug("Used memory data for payment %s (db_id=%d) -> unique_id=%s", payment_id, db_id, unique_payment_id)
+                # ВСЕГДА загружаем данные из CSV файла для каждой записи БД
+                # Не используем кэш памяти, так как у одного пользователя могут быть разные ведомости
+                row_dict = {}
+                if personal_path and os.path.exists(personal_path):
+                    try:
+                        df = get_cached_csv_data(personal_path)
+                        if isinstance(df, pd.DataFrame) and not df.empty:
+                            row_dict = df.iloc[0].to_dict()
+                        log.debug("Loaded CSV data for payment %s from %s", unique_payment_id, personal_path)
+                    except Exception:
+                        log.warning("Failed to read CSV for payment %s path=%s", unique_payment_id, personal_path)
                 else:
-                    # Загружаем из CSV файла
-                    row_dict = {}
-                    if personal_path and os.path.exists(personal_path):
-                        try:
-                            df = get_cached_csv_data(personal_path)
-                            if isinstance(df, pd.DataFrame) and not df.empty:
-                                row_dict = df.iloc[0].to_dict()
-                        except Exception:
-                            log.warning("Failed to read CSV for payment %s path=%s", unique_payment_id, personal_path)
+                    log.warning("Personal path not found for payment %s: %s", unique_payment_id, personal_path)
+                
+                payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+                
+                entry = {
+                    "id": unique_payment_id,
+                    "data": payment_data,
+                    "created_at": float(created_at_db) if created_at_db else time.time(),
+                    "status": status_db or "new",
+                    "db_id": db_id,  # Сохраняем db_id для отладки
+                    "original_payment_id": payment_id  # Сохраняем исходный payment_id
+                }
+                
+                if disagree_reason_db:
+                    entry["disagree_reason"] = disagree_reason_db
                     
-                    payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
-                    
-                    entry = {
-                        "id": unique_payment_id,
-                        "data": payment_data,
-                        "created_at": float(created_at_db) if created_at_db else time.time(),
-                        "status": status_db or "new",
-                        "db_id": db_id,  # Сохраняем db_id для отладки
-                        "original_payment_id": payment_id  # Сохраняем исходный payment_id
-                    }
-                    
-                    if disagree_reason_db:
-                        entry["disagree_reason"] = disagree_reason_db
-                        
-                    payments.append(entry)
+                payments.append(entry)
                     
             except Exception:
                 log.exception("Error loading payment from DB row %s", db_row)
@@ -1956,7 +1956,8 @@ def handle_message_new(event):
                         idx,
                         30,
                         p.get("created_at"),
-                        p.get("db_id")
+                        p.get("db_id"),
+                        p.get("data", {}).get("groups")  # Передаем информацию о группах
                     )
                     statements.append((p["id"], label))
                 vk.messages.send(
@@ -1980,7 +1981,8 @@ def handle_message_new(event):
                         idx,
                         30,
                         p.get("created_at"),
-                        p.get("db_id")
+                        p.get("db_id"),
+                        p.get("data", {}).get("groups")  # Передаем информацию о группах
                     )
                     statements.append((p["id"], label))
                 vk.messages.send(
