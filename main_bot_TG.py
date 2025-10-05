@@ -510,11 +510,13 @@ def start(update: Update, context: CallbackContext):
         '1) Пришли файл (CSV/XLSX) как вложение.\n'
         '2) Отправь команду:\n'
         '/send <предмет> <тип курса> <блок>\n\n'
-        'Также админы могут использовать:\n'
-        '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n\n'
+        'Команды для админов:\n'
+        '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
+        '/liststatements — показать список всех открытых и архивных ведомостей\n\n'
         'Примеры:\n'
         '/send Русский ОГЭ ПГК\n'
-        '/notify Русский ОГЭ ПГК\n\n'
+        '/notify Русский ОГЭ ПГК\n'
+        '/liststatements\n\n'
         '3) После публикации ведомости можно разослать уведомления участникам'
     'по vk_id командой /notify <название ведомости>.\n\n'
     )
@@ -978,6 +980,114 @@ def listadmins_command(update: Update, context: CallbackContext):
     text = 'Текущий список админов:\n' + '\n'.join(lines)
     msg.reply_text(text)
 
+def liststatements_command(update: Update, context: CallbackContext):
+    """Команда /liststatements — показывает все открытые и архивные ведомости."""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /liststatements from non-admin %s', from_id)
+        msg.reply_text('Только админы могут просматривать список ведомостей.')
+        return
+
+    try:
+        # Собираем открытые ведомости из папок
+        open_statements = []
+        open_path = os.path.join(HOSTING_ROOT, OPEN_DIRNAME)
+        
+        if os.path.exists(open_path):
+            # Проходим по всем папкам и ищем CSV файлы (не в папке users)
+            for root, dirs, files in os.walk(open_path):
+                # Пропускаем папку users
+                if 'users' in root:
+                    continue
+                    
+                for file in files:
+                    if file.endswith('.csv'):
+                        file_path = os.path.join(root, file)
+                        # Получаем время архивации из БД
+                        archive_time = get_archive_time_for_file(file)
+                        open_statements.append({
+                            'name': file,
+                            'path': file_path,
+                            'archive_at': archive_time
+                        })
+
+        # Собираем архивные ведомости из папок
+        archive_statements = []
+        archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+        
+        if os.path.exists(archive_path):
+            for root, dirs, files in os.walk(archive_path):
+                # Пропускаем папку users
+                if 'users' in root:
+                    continue
+                    
+                for file in files:
+                    if file.endswith('.csv'):
+                        archive_statements.append(file)
+
+        # Формируем ответ
+        response_lines = []
+        
+        # Открытые ведомости
+        response_lines.append('ОТКРЫТЫЕ ВЕДОМОСТИ:')
+        if open_statements:
+            for stmt in open_statements:
+                name = stmt['name']
+                archive_at = stmt['archive_at']
+                
+                if archive_at and archive_at > 0:
+                    now = int(time.time())
+                    hours_left = max(0, (archive_at - now) // 3600)
+                    if hours_left > 0:
+                        response_lines.append(f'  • {name} (архивация через {hours_left}ч)')
+                    else:
+                        response_lines.append(f'  • {name} (готова к архивации)')
+                else:
+                    response_lines.append(f'  • {name} (время архивации не установлено)')
+        else:
+            response_lines.append('  (нет открытых ведомостей)')
+        
+        response_lines.append('')
+        
+        # Архивные ведомости
+        response_lines.append('АРХИВНЫЕ ВЕДОМОСТИ:')
+        if archive_statements:
+            for name in sorted(archive_statements):
+                response_lines.append(f'  • {name}')
+        else:
+            response_lines.append('  (нет архивных ведомостей)')
+        
+        response = '\n'.join(response_lines)
+        
+        # Telegram ограничивает длину сообщений
+        if len(response) > 4000:
+            response = response[:4000] + '\n...(список обрезан)'
+        
+        msg.reply_text(response)
+        
+    except Exception as e:
+        log.exception('Error in liststatements_command')
+        msg.reply_text(f'Ошибка при получении списка ведомостей: {str(e)}')
+
+
+def get_archive_time_for_file(filename: str) -> int:
+    """Получает время архивации для файла из БД."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute('SELECT archive_at FROM vedomosti_users WHERE original_filename = ? LIMIT 1', (filename,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row and row[0]:
+            return int(row[0])
+        return 0
+    except Exception:
+        log.exception('Failed to get archive time for file %s', filename)
+        return 0
+
+
 def archive_command(update: Update, context: CallbackContext):
     """Команда для ручной архивации ведомостей (только для админов)."""
     if not is_admin(update.effective_user.id):
@@ -1209,6 +1319,7 @@ def run_bot():
             BotCommand('description', 'Показать описание процесса загрузки'),
             BotCommand('send', 'Отправить файл на хостинг: /send <предмет> <тип курса> <блок>'),
             BotCommand('notify', 'Разослать уведомление vk_id из БД (admin only)'),
+            BotCommand('liststatements', 'Показать список открытых и архивных ведомостей (admin only)'),
             BotCommand('addadmin', 'Добавить админа: /addadmin <username_or_id>'),
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
@@ -1223,6 +1334,7 @@ def run_bot():
     dp.add_handler(CommandHandler('description', description))
     dp.add_handler(CommandHandler('send', send_command))
     dp.add_handler(CommandHandler('notify', notify_command))
+    dp.add_handler(CommandHandler('liststatements', liststatements_command))
     dp.add_handler(CommandHandler('addadmin', addadmin_command))
     dp.add_handler(CommandHandler('deladmin', deladmin_command))
     dp.add_handler(CommandHandler('listadmins', listadmins_command))
