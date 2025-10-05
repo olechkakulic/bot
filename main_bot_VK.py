@@ -652,9 +652,13 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
     page_items = statements[start:end]
     rows = []
     for sid, label in page_items:
-        # Не вычисляем статус по всем пользователям — это может привести к некорректной маркировке.
+        # Ограничиваем длину кнопки для соответствия лимитам VK
+        if len(label) > 40:
+            button_label = label[:37] + "..."
+        else:
+            button_label = label
+            
         button_color = "primary"
-        button_label = label
         rows.append([
             {
                 "action": {
@@ -690,14 +694,21 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
     rows = []
     for idx, entry in enumerate(page_items, start=1 + start):
         sid = entry.get("id")
-        label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx)
         status = entry.get("status")
+        
+        # Учитываем статус при расчете максимальной длины
         if status == "agreed":
+            # Оставляем место для " ✅" (3 символа) 
+            max_label_length = 37
+            base_label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx, max_label_length)
+            button_label = f"{base_label} ✅"
             button_color = "positive"
-            button_label = f"{label} (Согласовано)"
         else:
+            # Полная длина для обычных кнопок
+            base_label = _format_payment_label(entry.get("data", {}).get('original_filename'), idx, 40)
+            button_label = base_label
             button_color = "primary"
-            button_label = label
+            
         rows.append([
             {
                 "action": {
@@ -1094,11 +1105,14 @@ def _to_float_str_money(value) -> str:
     except Exception:
         return '0'
 
-def _format_payment_label(original_filename: str, idx: int) -> str:
-    """Форматирует название выплаты для кнопки, убирая расширение .csv"""
+def _format_payment_label(original_filename: str, idx: int, max_length: int = 30) -> str:
+    """Форматирует название выплаты для кнопки, убирая расширение .csv и ограничивая длину"""
     if original_filename:
         # Убираем расширение .csv
         base_name = os.path.splitext(original_filename)[0]
+        # Ограничиваем длину
+        if len(base_name) > max_length:
+            return base_name[:max_length-3] + "..."
         return base_name
     else:
         return f"Ведомость {idx}"
