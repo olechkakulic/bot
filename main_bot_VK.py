@@ -169,6 +169,19 @@ def safe_vk_send(user_id: int, message: str, keyboard=None, max_retries: int = 3
                 log.warning("Rate limit hit for user %s, waiting %s seconds", user_id, wait_time)
                 time.sleep(wait_time)
                 continue
+            elif e.code == 911:  # Keyboard format error
+                log.error("Keyboard format error for user %s: %s. Sending message without keyboard.", user_id, e)
+                # Retry without keyboard
+                try:
+                    vk.messages.send(
+                        user_id=user_id,
+                        random_id=vk_api.utils.get_random_id(),
+                        message=message
+                    )
+                    return True
+                except Exception:
+                    log.exception("Failed to send message without keyboard")
+                    return False
             elif e.code in [7, 9]:  # Permission denied or flood control
                 log.warning("Permission denied or flood control for user %s: %s", user_id, e)
                 return False
@@ -645,7 +658,7 @@ def chat_bottom_keyboard():
     return json.dumps(kb, ensure_ascii=False)
 
 
-def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
+def payments_list_keyboard(statements, page: int = 0, page_size: int = 5):
     total = len(statements)
     start = page * page_size
     end = start + page_size
@@ -677,11 +690,17 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
                 "color": "secondary"
             }
         ])
+    
+    # VK API inline keyboard limit safety check
+    if len(rows) > 6:
+        log.warning("Keyboard exceeds VK API 6-row limit: %d rows, truncating", len(rows))
+        rows = rows[:6]
+        
     kb = {"inline": True, "buttons": rows}
     return json.dumps(kb, ensure_ascii=False)
 
 
-def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 6):
+def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 5):
     """Клавиатура списка выплат для конкретного пользователя с учетом его статусов."""
     total = len(user_payments_list)
     start = page * page_size
@@ -720,6 +739,12 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
                 "color": "secondary"
             }
         ])
+    
+    # VK API inline keyboard limit safety check
+    if len(rows) > 6:
+        log.warning("Keyboard exceeds VK API 6-row limit: %d rows, truncating", len(rows))
+        rows = rows[:6]
+        
     kb = {"inline": True, "buttons": rows}
     return json.dumps(kb, ensure_ascii=False)
 
@@ -775,6 +800,11 @@ def payments_disagree_keyboard(payment_id: str):
         "color": "positive"
     }
     rows.append([agree_btn])
+    
+    # VK API inline keyboard limit safety check
+    if len(rows) > 6:
+        log.warning("Payments disagree keyboard exceeds VK API 6-row limit: %d rows, truncating", len(rows))
+        rows = rows[:6]
     
     kb = {"inline": True, "buttons": rows}
     return json.dumps(kb, ensure_ascii=False)
