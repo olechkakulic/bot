@@ -119,7 +119,7 @@ def init_db():
 
 
 def ensure_vedomosti_status_columns():
-    """Ensure columns status, disagree_reason, confirmed_at, created_at, archive_at exist in vedomosti_users."""
+    """Ensure columns status, disagree_reason, confirmed_at, created_at, archive_at, warning_sent exist in vedomosti_users."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
@@ -135,9 +135,11 @@ def ensure_vedomosti_status_columns():
             c.execute("ALTER TABLE vedomosti_users ADD COLUMN created_at INTEGER DEFAULT 0")
         if 'archive_at' not in cols:
             c.execute("ALTER TABLE vedomosti_users ADD COLUMN archive_at INTEGER DEFAULT 0")
+        if 'warning_sent' not in cols:
+            c.execute("ALTER TABLE vedomosti_users ADD COLUMN warning_sent INTEGER DEFAULT 0")
         conn.commit()
         conn.close()
-        log.info('SQLite columns ensured: status/disagree_reason/confirmed_at/created_at/archive_at')
+        log.info('SQLite columns ensured: status/disagree_reason/confirmed_at/created_at/archive_at/warning_sent')
     except Exception:
         log.exception('Failed to ensure vedomosti status columns')
 
@@ -1329,14 +1331,14 @@ def remove_vedomosti_from_db(filename: str):
         return 0
 
 def get_users_to_warn(filename: str):
-    """Получить список пользователей для предупреждения о скорой архивации."""
+    """Получить список пользователей для предупреждения о скорой архивации (исключая пользователей со статусом agreed и уже получивших предупреждение)."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
         c.execute('''
             SELECT DISTINCT vk_id 
             FROM vedomosti_users 
-            WHERE original_filename = ? AND state LIKE 'imported:%'
+            WHERE original_filename = ? AND state LIKE 'imported:%' AND status != 'agreed' AND warning_sent = 0
         ''', (filename,))
         rows = c.fetchall()
         conn.close()
@@ -1372,6 +1374,22 @@ def send_archive_warning(vk_id: str, filename: str, archive_at: int):
     except Exception:
         log.exception('Failed to send archive warning to user %s', vk_id)
         return False
+
+def mark_warning_sent(vk_id: str, filename: str):
+    """Отметить, что предупреждение было отправлено пользователю."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute('''
+            UPDATE vedomosti_users 
+            SET warning_sent = 1 
+            WHERE vk_id = ? AND original_filename = ?
+        ''', (vk_id, filename))
+        conn.commit()
+        conn.close()
+        log.info('Marked warning as sent for user %s, filename %s', vk_id, filename)
+    except Exception:
+        log.exception('Failed to mark warning as sent for user %s, filename %s', vk_id, filename)
 
 def process_archive():
     """Основная функция архивации - проверяет и архивирует ведомости."""
@@ -1423,7 +1441,9 @@ def process_warnings():
             users = get_users_to_warn(filename)
             
             for vk_id in users:
-                send_archive_warning(vk_id, filename, archive_at)
+                if send_archive_warning(vk_id, filename, archive_at):
+                    # Отмечаем, что предупреждение было отправлено
+                    mark_warning_sent(vk_id, filename)
                 time.sleep(2)  # Пауза 2 секунды между отправками (сервер)
                 
     except Exception:
