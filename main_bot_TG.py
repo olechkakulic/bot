@@ -135,9 +135,14 @@ def ensure_vedomosti_status_columns():
             c.execute("ALTER TABLE vedomosti_users ADD COLUMN created_at INTEGER DEFAULT 0")
         if 'archive_at' not in cols:
             c.execute("ALTER TABLE vedomosti_users ADD COLUMN archive_at INTEGER DEFAULT 0")
+        # Track archive warning dispatch
+        if 'warning_sent' not in cols:
+            c.execute("ALTER TABLE vedomosti_users ADD COLUMN warning_sent INTEGER DEFAULT 0")
+        if 'warning_sent_at' not in cols:
+            c.execute("ALTER TABLE vedomosti_users ADD COLUMN warning_sent_at INTEGER DEFAULT 0")
         conn.commit()
         conn.close()
-        log.info('SQLite columns ensured: status/disagree_reason/confirmed_at/created_at/archive_at')
+        log.info('SQLite columns ensured: status/disagree_reason/confirmed_at/created_at/archive_at/warning_sent')
     except Exception:
         log.exception('Failed to ensure vedomosti status columns')
 
@@ -1329,46 +1334,45 @@ def remove_vedomosti_from_db(filename: str):
         return 0
 
 def get_users_to_warn(filename: str):
-    """Получить список пользователей для предупреждения о скорой архивации."""
+    """Получить список уникальных vk_id для предупреждения о скорой архивации.
+    Исключает пользователей со статусом 'agreed' и тех, кому уже отправлено предупреждение по этой ведомости.
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
         c.execute('''
-            SELECT DISTINCT vk_id 
-            FROM vedomosti_users 
-            WHERE original_filename = ? AND state LIKE 'imported:%'
+            SELECT DISTINCT vk_id
+            FROM vedomosti_users
+            WHERE original_filename = ?
+              AND state LIKE 'imported:%'
+              AND IFNULL(status, '') <> 'agreed'
+              AND IFNULL(warning_sent, 0) = 0
         ''', (filename,))
         rows = c.fetchall()
         conn.close()
-        return [row[0] for row in rows]
+        return [str(r[0]) for r in rows if r and str(r[0]).strip()]
     except Exception:
         log.exception('Failed to get users to warn for filename %s', filename)
         return []
 
 def send_archive_warning(vk_id: str, filename: str, archive_at: int):
-    """Отправить предупреждение пользователю о скорой архивации."""
+    """Отправить предупреждение пользователю о скорой архивации (через REST VK API)."""
     try:
         if not VK_TOKEN or not GROUP_ID:
             log.warning('VK credentials not configured, cannot send warning to %s', vk_id)
             return False
-            
-        import vk_api
-        vk_session = vk_api.VkApi(token=VK_TOKEN)
-        vk = vk_session.get_api()
-        
-        # Убираем расширение .csv из названия файла
-        base_filename = filename.replace('.csv', '') if filename.endswith('.csv') else filename
-        
-        hours_left = (archive_at - int(time.time())) // 3600
-        message = f"Внимание! Ведомость '{base_filename}' будет заархивирована через {hours_left} часов. Пожалуйста, подтвердите или оспорьте выплату до этого времени."
-        
-        vk.messages.send(
-            user_id=int(vk_id),
-            random_id=random.randint(1, 2**31),
-            message=message
+
+        base_filename = filename[:-4] if filename.endswith('.csv') else filename
+        hours_left = max(0, (archive_at - int(time.time())) // 3600)
+        message = (
+            f"Внимание! Ведомость '{base_filename}' будет заархивирована через {hours_left} часов. "
+            f"Пожалуйста, подтвердите или оспорьте выплату до этого времени."
         )
-        log.info('Sent archive warning to user %s for filename %s', vk_id, filename)
-        return True
+
+        ok = send_vk_message(str(vk_id), message)
+        if ok:
+            log.info('Sent archive warning to user %s for filename %s', vk_id, filename)
+        return ok
     except Exception:
         log.exception('Failed to send archive warning to user %s', vk_id)
         return False
@@ -1420,10 +1424,24 @@ def process_warnings():
         conn.close()
         
         for filename, archive_at in rows:
-            users = get_users_to_warn(filename)
-            
-            for vk_id in users:
-                send_archive_warning(vk_id, filename, archive_at)
+            # Получаем только тех пользователей, кому ещё не отправляли и кто не agreed
+            vk_ids = get_users_to_warn(filename)
+
+            for vk_id in vk_ids:
+                sent_ok = send_archive_warning(vk_id, filename, int(archive_at))
+                if sent_ok:
+                    try:
+                        conn2 = sqlite3.connect(DB_PATH, timeout=30)
+                        c2 = conn2.cursor()
+                        # Помечаем все строки этой ведомости для данного vk_id
+                        c2.execute(
+                            'UPDATE vedomosti_users SET warning_sent = 1, warning_sent_at = ? WHERE original_filename = ? AND vk_id = ?',
+                            (int(time.time()), filename, str(vk_id))
+                        )
+                        conn2.commit()
+                        conn2.close()
+                    except Exception:
+                        log.exception('Failed to mark warning_sent for vk_id=%s (file=%s)', vk_id, filename)
                 time.sleep(2)  # Пауза 2 секунды между отправками (сервер)
                 
     except Exception:
