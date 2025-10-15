@@ -386,6 +386,7 @@ def import_users_from_csv(dest_path: str, original_filename: str):
             # было одного общего payment_id для всех пользователей одной ведомости.
             for vk_str, personal_path, original_filename in db_operations:
                 unique_state = f"imported:{uuid.uuid4()}"
+                log.info('Creating unique state for vk_id=%s: %s', vk_str, unique_state)
                 c.execute(
                     'INSERT INTO vedomosti_users(vk_id, personal_path, original_filename, state, created_at, archive_at) VALUES (?,?,?,?,?,?)',
                     (str(vk_str), personal_path, original_filename, unique_state, now, archive_time)
