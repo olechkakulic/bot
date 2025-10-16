@@ -2049,6 +2049,10 @@ def handle_message_new(event):
                     )
                 else:
                     p["status"] = "agree_pro_pending"
+                    # Записываем отказ от приглашения в Google-таблицу
+                    filename = p.get("data", {}).get("original_filename", "") if p else ""
+                    filepath = f"hosting/open/{filename}" if filename else ""
+                    log_complaint_to_sheet(from_id, "Отказ от приглашения в Консоль ПРО", filename, filepath)
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
@@ -2108,12 +2112,15 @@ def handle_message_new(event):
                     message="Ведомость не найдена (неверный номер)."
                 )
                 return
-        vk.messages.send(
-            user_id=from_id,
-            random_id=vk_api.utils.get_random_id(),
-            message="Я бот по согласованию выплат. Нажмите кнопку 'К списку выплат' или дождитесь уведомления о выплате.",
-            keyboard=chat_bottom_keyboard()
-        )
+        # Проверяем, является ли это командой "Начать"
+        if text.lower() in ["начать", "start", "привет", "hello", "hi"]:
+            vk.messages.send(
+                user_id=from_id,
+                random_id=vk_api.utils.get_random_id(),
+                message="Я бот по согласованию выплат. Нажмите кнопку 'К списку выплат' или дождитесь уведомления о выплате.",
+                keyboard=chat_bottom_keyboard()
+            )
+        # Для всех остальных сообщений не отправляем приветственное сообщение
     except Exception:
         log.exception("Ошибка в handle_message_new: %s", traceback.format_exc())
 
