@@ -763,10 +763,11 @@ def notify_command(update: Update, context: CallbackContext):
 
     summary = f'Рассылка завершена. Всего: {total}, успешно: {sent}, неудач: {failed}.'
     if failed_list:
-        sample_fail = ', '.join(map(str, failed_list[:20]))
-        if len(failed_list) > 20:
-            sample_fail += f', ...(+{len(failed_list)-20} ещё)'
-        summary += f'\nНе доставлено: {sample_fail}'
+        # выводим айдишники столбиком, чтобы удобнее читать
+        sample_ids = list(map(str, failed_list[:20]))
+        more_suffix = f"\n...(+{len(failed_list)-20} ещё)" if len(failed_list) > 20 else ""
+        column = "\n".join(sample_ids)
+        summary += f"\nНе доставлено:\n{column}{more_suffix}"
 
     update.message.reply_text(summary)
 # ----------------- other command handlers (unchanged) -----------------
