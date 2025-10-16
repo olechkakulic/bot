@@ -1620,6 +1620,10 @@ def handle_message_event(event):
             else:
                 p["status"] = "agree_pro_pending"
                 safe_vk_send(user_id, "Прими приглашение в Консоль ПРО, затем повторно подтвердите выплату.")
+                # Логируем отказ принять приглашение в Консоль ПРО в таблицу, чтобы оператор увидел
+                filename = p.get("data", {}).get("original_filename", "") if p else ""
+                filepath = f"hosting/open/{filename}" if filename else ""
+                log_complaint_to_sheet(user_id, "Не принял приглашение в Консоль ПРО", filename, filepath)
                 log.info("User %s has not accepted PRO invite for payment %s", user_id, payment_id)
         elif cmd == "disagree_reason":
             sid = payload.get("payment_id")
@@ -2054,6 +2058,10 @@ def handle_message_new(event):
                         random_id=vk_api.utils.get_random_id(),
                         message="Примите приглашение в Консоль ПРО, затем повторно подтвердите выплату. С вами свяжется оператор."
                     )
+                    # Логируем отказ принять приглашение в Консоль ПРО в таблицу
+                    filename = p.get("data", {}).get("original_filename", "") if p else ""
+                    filepath = f"hosting/open/{filename}" if filename else ""
+                    log_complaint_to_sheet(from_id, "Не принял приглашение в Консоль ПРО", filename, filepath)
                 return
         if text.lower() == "к списку выплат" or text == "К списку выплат":
             payments = get_all_payments_for_user_from_db(from_id)
@@ -2108,12 +2116,14 @@ def handle_message_new(event):
                     message="Ведомость не найдена (неверный номер)."
                 )
                 return
-        vk.messages.send(
-            user_id=from_id,
-            random_id=vk_api.utils.get_random_id(),
-            message="Я бот по согласованию выплат. Нажмите кнопку 'К списку выплат' или дождитесь уведомления о выплате.",
-            keyboard=chat_bottom_keyboard()
-        )
+        # Приветственное сообщение показываем только при явной команде "Начать"/"/start"
+        if text.lower() in ("начать", "/start", "start"):
+            vk.messages.send(
+                user_id=from_id,
+                random_id=vk_api.utils.get_random_id(),
+                message="Я бот по согласованию выплат. Нажмите кнопку 'К списку выплат' или дождитесь уведомления о выплате.",
+                keyboard=chat_bottom_keyboard()
+            )
     except Exception:
         log.exception("Ошибка в handle_message_new: %s", traceback.format_exc())
 
