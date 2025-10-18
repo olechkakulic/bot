@@ -1301,6 +1301,12 @@ def format_message(file_name, uid, course_type, deadline):
     fines_section = f"\n\n→ Штрафы: -{fines_val}₽" if fines_val > 0 else f"\n\nШтрафы: отсутствуют"
 
     total_section = f"\n\n→ ИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
+    
+    # Добавляем комментарий, если он есть
+    comment = p.get('comment', '')
+    if comment and str(comment).strip():
+        total_section += f"\n[!!!] Комментарий: {comment}"
+    
     final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
              "\nНажмите «Не согласен», если Вы не согласны с каким-либо из пунктов"
              f"\nДедлайн по согласованию выплаты: {deadline}")
