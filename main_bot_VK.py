@@ -1593,11 +1593,11 @@ def handle_message_event(event):
                 return
             if choice == "yes":
                 p["status"] = "agree_pending_pro"
-                safe_vk_send(user_id, "Приняли ли вы приглашение в Консоль ПРО?", yes_no_keyboard("agree_pro", payment_id))
+                safe_vk_send(user_id, "Подписан ли у Вас договор в приложении Консоль Про? Краткая справка, как проверить: Консоль Про ->  раздел компании. Если там есть компания ООО '100балльный репетитор', то договор подписан.", yes_no_keyboard("agree_pro", payment_id))
                 log.info("User %s verified data for payment %s", user_id, payment_id)
             else:
                 p["status"] = "agree_data_mismatch"
-                safe_vk_send(user_id, "С вами свяжется оператор.")
+                safe_vk_send(user_id, "С Вами свяжется оператор.")
                 log.info("User %s reported data mismatch for payment %s", user_id, payment_id)
                 p = find_payment(user_id, payment_id)
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
@@ -1615,7 +1615,7 @@ def handle_message_event(event):
                     update_vedomosti_status_by_payment(payment_id, "agreed")
                 except Exception:
                     log.exception("Failed to persist agree status for payment %s", payment_id)
-                safe_vk_send(user_id, "Вы подтвердили выплату. Спасибо!")
+                safe_vk_send(user_id, " Вы согласовали выплату. Спасибо! В течение 10 дней в приложении Консоль Вам придет акт, который необходимо подписать. После этого в течение n количества времени на реквизиты Вашего банковского счета придет выплата.")
                 log.info("User %s agreed payment %s after PRO confirmation", user_id, payment_id)
             else:
                 p["status"] = "agree_pro_pending"
@@ -1639,7 +1639,7 @@ def handle_message_event(event):
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
                 filepath = f"hosting/open/{filename}" if filename else ""
                 log_complaint_to_sheet(user_id, f"Иная причина (связаться с оператором)", filename, filepath)
-                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с вами.")
+                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с Вами.")
                 log.info("User %s chose other reason for %s -> operator handoff", user_id, sid)
                 return
             if p:
@@ -1682,8 +1682,8 @@ def handle_message_event(event):
                     log.exception("Failed to persist disagreed for %s", sid)
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
                 filepath = f"hosting/open/{filename}" if filename else ""
-                log_complaint_to_sheet(user_id, f"Несогласен с пунктом: {reason}", filename, filepath)
-                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с вами.")
+                log_complaint_to_sheet(user_id, f"Не согласен с пунктом: {reason}", filename, filepath)
+                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с Вами.")
                 log.info("User %s decided disagree_point for %s (persisted)", user_id, sid)
         elif cmd == "agree_payment":
             # Обработка кнопки "Согласиться с ведомостью" из общего списка
@@ -1736,7 +1736,7 @@ def handle_message_event(event):
         elif cmd == "to_list":
             payments = get_all_payments_for_user_from_db(user_id)
             if not payments:
-                safe_vk_send(user_id, "У вас нет выплат.", chat_bottom_keyboard())
+                safe_vk_send(user_id, "У Вас нет выплат.", chat_bottom_keyboard())
                 return
             safe_vk_send(user_id, "Список ведомостей (выберите):", payments_list_keyboard_for_user(payments, page=0))
             log.info("Sent payments list to %s", user_id)
@@ -1745,7 +1745,7 @@ def handle_message_event(event):
             page = int(payload.get("page", 0))
             payments = get_all_payments_for_user_from_db(user_id)
             if not payments:
-                safe_vk_send(user_id, "У вас нет выплат.")
+                safe_vk_send(user_id, "У Вас нет выплат.")
                 return
             safe_vk_send(user_id, f"Список ведомостей (страница {page+1}):", payments_list_keyboard_for_user(payments, page=page))
             return
@@ -1853,7 +1853,7 @@ def handle_message_new(event):
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Сообщение передано оператору. Он скоро свяжется с вами."
+                        message="Сообщение передано оператору. Он скоро свяжется с Вами."
                     )
                     return
                 if p:
@@ -1903,11 +1903,11 @@ def handle_message_new(event):
                         log.exception("Failed to persist disagreed for %s", sid)
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
-                    log_complaint_to_sheet(from_id, f"Несогласен с пунктом: {reason}", filename, filepath)
+                    log_complaint_to_sheet(from_id, f"Не согласен с пунктом: {reason}", filename, filepath)
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Сообщение передано оператору. Он скоро свяжется с вами."
+                        message="Сообщение передано оператору. Он скоро свяжется с Вами."
                     )
                 return
             if cmd == "agree_payment":
@@ -1962,7 +1962,7 @@ def handle_message_new(event):
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="У вас нет выплат.",
+                        message="У Вас нет выплат.",
                         keyboard=chat_bottom_keyboard()
                     )
                     return
@@ -1989,7 +1989,7 @@ def handle_message_new(event):
                 page = int(payload.get("page", 0))
                 payments = get_all_payments_for_user_from_db(from_id)
                 if not payments:
-                    vk.messages.send(user_id=from_id, random_id=vk_api.utils.get_random_id(), message="У вас нет выплат.")
+                    vk.messages.send(user_id=from_id, random_id=vk_api.utils.get_random_id(), message="У Вас нет выплат.")
                     return
                 statements = []
                 for idx, p in enumerate(payments, start=1):
@@ -2020,7 +2020,7 @@ def handle_message_new(event):
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Приняли ли вы приглашение в Консоль ПРО?",
+                        message="Подписан ли у Вас договор в приложении Консоль Про? Краткая справка, как проверить: Консоль Про ->  раздел компании. Если там есть компания ООО '100балльный репетитор', то договор подписан. ",
                         keyboard=yes_no_keyboard("agree_pro", sid)
                     )
                 else:
@@ -2028,7 +2028,7 @@ def handle_message_new(event):
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="С вами свяжется оператор."
+                        message="С Вами свяжется оператор."
                     )
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
@@ -2049,19 +2049,19 @@ def handle_message_new(event):
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Вы подтвердили выплату. Спасибо!"
+                        message=" Вы согласовали выплату. Спасибо! В течение 10 дней в приложении Консоль Вам придет акт, который необходимо подписать. После этого в течение n количества времени на реквизиты Вашего банковского счета придет выплата."
                     )
                 else:
                     p["status"] = "agree_pro_pending"
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Примите приглашение в Консоль ПРО, затем повторно подтвердите выплату. С вами свяжется оператор."
+                        message="С Вами свяжется оператор."
                     )
                     # Логируем отказ принять приглашение в Консоль ПРО в таблицу
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
-                    log_complaint_to_sheet(from_id, "Не принял приглашение в Консоль ПРО", filename, filepath)
+                    log_complaint_to_sheet(from_id, "Не подписал договор", filename, filepath)
                 return
         if text.lower() == "к списку выплат" or text == "К списку выплат":
             payments = get_all_payments_for_user_from_db(from_id)
@@ -2069,7 +2069,7 @@ def handle_message_new(event):
                 vk.messages.send(
                     user_id=from_id,
                     random_id=vk_api.utils.get_random_id(),
-                    message="У вас нет выплат.",
+                    message="У Вас нет выплат.",
                     keyboard=chat_bottom_keyboard()
                 )
                 return
