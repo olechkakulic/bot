@@ -640,7 +640,7 @@ def notify_command(update: Update, context: CallbackContext):
     failed_list = []
 
     # Формируем текст. Используем NOTIFY_TEXT, если есть.
-    text_plain = NOTIFY_TEXT or "У вас появилась новая выплата, проверьте список выплат."
+    text_plain = NOTIFY_TEXT or "У Вас появилась новая выплата на согласование. Нажмите на кнопку 'К списку выплат'. "
     # Если у тебя есть PAYMENTS_URL и хочешь добавить ссылку в текст, можно:
     try:
         PAYMENTS_URL  # может быть не объявлена в этом модуле
