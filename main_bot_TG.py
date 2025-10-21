@@ -522,7 +522,8 @@ def start(update: Update, context: CallbackContext):
         'Команды для админов:\n'
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
-        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК.\n'
+        '/archive <название ведомости> - переместить ведомость в архив сразу\n'
+        '/delete <название ведомости> - удалить ведомость (и из архива тоже)\n'
     )
 
 def description(update: Update, context: CallbackContext):
@@ -538,7 +539,8 @@ def description(update: Update, context: CallbackContext):
         'Команды для админов:\n'
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
-        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК.\n'
+        '/archive <название ведомости> - переместить ведомость в архив сразу\n'
+        '/delete <название ведомости> - удалить ведомость (и из архива тоже)\n'
     )
 
 def handle_document(update: Update, context: CallbackContext):
@@ -1196,6 +1198,129 @@ def find_statement_folder_flexible(statement_name: str) -> str:
     return None
 
 
+def find_statement_folder_in_archive(filename: str) -> str:
+    """Находит папку в архиве, содержащую указанный файл ведомости."""
+    archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+    if not os.path.exists(archive_path):
+        return None
+    for root, dirs, files in os.walk(archive_path):
+        if 'users' in root:
+            continue
+        if filename in files:
+            return root
+    return None
+
+
+def find_statement_folder_flexible_in_archive(statement_name: str) -> str:
+    """Гибкий поиск в архиве (игнорирует различия пробелов и подчёркиваний)."""
+    archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+    if not os.path.exists(archive_path):
+        return None
+    normalized_search = statement_name.replace(' ', '_').replace('_', ' ').lower()
+    for root, dirs, files in os.walk(archive_path):
+        if 'users' in root:
+            continue
+        for file in files:
+            if file.endswith('.csv'):
+                file_normalized = file.replace('.csv', '').replace('_', ' ').lower()
+                if normalized_search in file_normalized or file_normalized in normalized_search:
+                    return root
+    return None
+
+
+def delete_statement_folder(folder_path: str) -> bool:
+    """Удаляет папку ведомости (со всеми файлами)."""
+    try:
+        if os.path.exists(folder_path):
+            shutil.rmtree(folder_path)
+            log.info('Deleted statement folder: %s', folder_path)
+            return True
+        log.warning('Statement folder to delete not found: %s', folder_path)
+        return False
+    except Exception:
+        log.exception('Failed to delete statement folder: %s', folder_path)
+        return False
+
+
+def delete_command(update: Update, context: CallbackContext):
+    """Команда /delete <название> — удаляет ведомость из открытых или архивных папок и записи из БД."""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /delete from non-admin %s', from_id)
+        msg.reply_text('Только админы могут удалять ведомости.')
+        return
+
+    if not context.args:
+        msg.reply_text(
+            'Укажите название ведомости для удаления.\n'
+            'Использование: /delete <название ведомости>\n'
+            'Пример: /delete Русский ОГЭ ПГК'
+        )
+        return
+
+    statement_name = ' '.join(context.args).strip()
+
+    try:
+        # Сначала пробуем точное имя файла в стиле open: "Имя_Тип_Блок.csv"
+        normalized = statement_name.replace(' ', '_')
+        target_filename = normalized + '.csv'
+
+        # 1) Ищем в открытых папках
+        folder = find_statement_folder(target_filename)
+        location = 'open'
+
+        # 2) Если не нашли — гибкий поиск в открытых
+        if not folder:
+            folder = find_statement_folder_flexible(statement_name)
+            if folder:
+                # Выберем реальное имя csv из найденной папки
+                try:
+                    any_csv = [f for f in os.listdir(folder) if f.endswith('.csv')]
+                    if any_csv:
+                        target_filename = any_csv[0]
+                except Exception:
+                    pass
+
+        # 3) Если в открытых не нашли — ищем в архиве (точно, затем гибко)
+        if not folder:
+            location = 'archive'
+            folder = find_statement_folder_in_archive(target_filename)
+            if not folder:
+                folder = find_statement_folder_flexible_in_archive(statement_name)
+                if folder:
+                    try:
+                        any_csv = [f for f in os.listdir(folder) if f.endswith('.csv')]
+                        if any_csv:
+                            target_filename = any_csv[0]
+                    except Exception:
+                        pass
+
+        if not folder:
+            msg.reply_text(
+                f'Ведомость "{statement_name}" не найдена ни в открытых, ни в архивных папках.\n'
+                'Проверьте название или используйте /liststatements для просмотра списка.'
+            )
+            return
+
+        # Удаляем папку
+        ok = delete_statement_folder(folder)
+        # Чистим БД (на всякий случай — даже если уже была заархивирована)
+        removed_db = remove_users_from_statement(target_filename)
+
+        if ok:
+            where = 'из открытых' if location == 'open' else 'из архива'
+            msg.reply_text(
+                f'Ведомость "{target_filename}" успешно удалена {where}.\n'
+                f'Удалено записей из БД: {removed_db}'
+            )
+        else:
+            msg.reply_text(f'Не удалось удалить папку ведомости для "{target_filename}". Проверьте логи.')
+
+    except Exception as e:
+        log.exception('Error in delete command for %s', statement_name)
+        msg.reply_text(f'Ошибка при удалении ведомости: {str(e)}')
+
 def count_users_in_statement(filename: str) -> int:
     """Подсчитывает количество пользователей ведомости в БД."""
     try:
@@ -1489,7 +1614,8 @@ def run_bot():
             BotCommand('addadmin', 'Добавить админа: /addadmin <username_or_id>'),
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
-            BotCommand('archive', 'Переместить ведомость в архив: /archive <название>')
+            BotCommand('archive', 'Переместить ведомость в архив: /archive <название>'),
+            BotCommand('delete', 'Удалить ведомость (в т.ч. из архива): /delete <название>')
         ]
         updater.bot.set_my_commands(commands)
         log.info('Bot commands (menu) set: %s', [c.command for c in commands])
@@ -1505,6 +1631,7 @@ def run_bot():
     dp.add_handler(CommandHandler('deladmin', deladmin_command))
     dp.add_handler(CommandHandler('listadmins', listadmins_command))
     dp.add_handler(CommandHandler('archive', archive_command))
+    dp.add_handler(CommandHandler('delete', delete_command))
     dp.add_handler(MessageHandler(Filters.document, handle_document))
     dp.add_handler(MessageHandler(Filters.command, unknown))
 
