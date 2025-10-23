@@ -522,7 +522,8 @@ def start(update: Update, context: CallbackContext):
         'Команды для админов:\n'
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
-        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК.\n'
+        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК\n'
+        '/delete <название ведомости> - удалить архивную ведомость полностью\n'
     )
 
 def description(update: Update, context: CallbackContext):
@@ -538,7 +539,8 @@ def description(update: Update, context: CallbackContext):
         'Команды для админов:\n'
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
-        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК.\n'
+        '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК\n'
+        '/delete <название ведомости> - удалить архивную ведомость полностью\n'
     )
 
 def handle_document(update: Update, context: CallbackContext):
@@ -1255,6 +1257,95 @@ def remove_users_from_statement(filename: str) -> int:
         log.exception('Failed to remove users from DB for statement %s', filename)
         return 0
 
+
+def delete_command(update: Update, context: CallbackContext):
+    """Команда для удаления архивной ведомости: /delete <название ведомости>"""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /delete from non-admin %s', from_id)
+        msg.reply_text('Только админы могут удалять ведомости.')
+        return
+
+    # Получаем название ведомости
+    if not context.args:
+        msg.reply_text(
+            'Укажите название ведомости для удаления.\n'
+            'Использование: /delete <название ведомости>\n'
+            'Пример: /delete Хим_Катя_ГК_1блок\n\n'
+            'Для просмотра доступных ведомостей используйте /liststatements'
+        )
+        return
+    
+    statement_name = ' '.join(context.args).strip()
+    
+    try:
+        # Ищем ведомость в архивных папках
+        archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+        statement_folder = None
+        target_filename = None
+        
+        if os.path.exists(archive_path):
+            # Ищем точное совпадение
+            for root, dirs, files in os.walk(archive_path):
+                if 'users' in root:
+                    continue
+                for file in files:
+                    if file.endswith('.csv'):
+                        file_base = os.path.splitext(file)[0]
+                        if file_base == statement_name or file == statement_name:
+                            statement_folder = root
+                            target_filename = file
+                            break
+                if statement_folder:
+                    break
+            
+            # Если не нашли точное совпадение, ищем по частичному совпадению
+            if not statement_folder:
+                for root, dirs, files in os.walk(archive_path):
+                    if 'users' in root:
+                        continue
+                    for file in files:
+                        if file.endswith('.csv'):
+                            file_base = os.path.splitext(file)[0]
+                            if statement_name.lower() in file_base.lower() or file_base.lower() in statement_name.lower():
+                                statement_folder = root
+                                target_filename = file
+                                break
+                    if statement_folder:
+                        break
+        
+        if not statement_folder or not target_filename:
+            msg.reply_text(f'Архивная ведомость "{statement_name}" не найдена.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
+            return
+        
+        # Подсчитываем количество пользователей в БД
+        users_count = count_users_in_statement(target_filename)
+        
+        msg.reply_text(f'Начинаю удаление архивной ведомости "{statement_name}".\nНайдено пользователей в БД: {users_count}')
+        
+        # Удаляем папку с ведомостью
+        try:
+            shutil.rmtree(statement_folder)
+            log.info('Deleted archived statement folder: %s', statement_folder)
+        except Exception as e:
+            log.exception('Failed to delete archived statement folder %s: %s', statement_folder, e)
+            msg.reply_text(f'Ошибка при удалении папки ведомости: {str(e)}')
+            return
+        
+        # Удаляем записи из БД
+        removed_count = remove_users_from_statement(target_filename)
+        
+        msg.reply_text(
+            f'Архивная ведомость "{statement_name}" успешно удалена.\n'
+            f'Папка удалена: {statement_folder}\n'
+            f'Удалено записей из БД: {removed_count}'
+        )
+        
+    except Exception as e:
+        log.exception('Error in delete command')
+        msg.reply_text(f'Ошибка при удалении: {str(e)}')
+
 def unknown(update: Update, context: CallbackContext):
     update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок>.')
 
@@ -1489,7 +1580,8 @@ def run_bot():
             BotCommand('addadmin', 'Добавить админа: /addadmin <username_or_id>'),
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
-            BotCommand('archive', 'Переместить ведомость в архив: /archive <название>')
+            BotCommand('archive', 'Переместить ведомость в архив: /archive <название>'),
+            BotCommand('delete', 'Удалить архивную ведомость: /delete <название>')
         ]
         updater.bot.set_my_commands(commands)
         log.info('Bot commands (menu) set: %s', [c.command for c in commands])
@@ -1505,6 +1597,7 @@ def run_bot():
     dp.add_handler(CommandHandler('deladmin', deladmin_command))
     dp.add_handler(CommandHandler('listadmins', listadmins_command))
     dp.add_handler(CommandHandler('archive', archive_command))
+    dp.add_handler(CommandHandler('delete', delete_command))
     dp.add_handler(MessageHandler(Filters.document, handle_document))
     dp.add_handler(MessageHandler(Filters.command, unknown))
 
