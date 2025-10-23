@@ -519,6 +519,8 @@ def start(update: Update, context: CallbackContext):
         'Пример: /send Русский ОГЭ ПГК\n'
         '3) После публикации ведомости можно разослать уведомления участникам по vk_id командой /notify <название ведомости>.\n'
         'Пример: /notify Русский ОГЭ ПГК\n\n'
+        'Обновление уже опубликованной ведомости:\n'
+        '/update <название ведомости> — заменяет файл ведомости и персональные файлы, уведомляя только тех, у кого данные изменились.\n\n'
         'Команды для админов:\n'
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
@@ -536,6 +538,8 @@ def description(update: Update, context: CallbackContext):
         'Пример: /send Русский ОГЭ ПГК\n'
         '3) После публикации ведомости можно разослать уведомления участникам по vk_id командой /notify <название ведомости>.\n'
         'Пример: /notify Русский ОГЭ ПГК\n\n'
+        'Обновление уже опубликованной ведомости:\n'
+        '/update <название ведомости> — заменяет файл ведомости и персональные файлы, уведомляя только тех, у кого данные изменились.\n\n'
         'Команды для админов:\n'
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
@@ -576,9 +580,14 @@ def handle_document(update: Update, context: CallbackContext):
 
     save_current_for_user(from_id, file_path=local_path, awaiting_meta=True)
 
-    reply = ('Файл сохранён, ожидает публикации.\n'
-             'Отправьте инфу командой: /send <предмет> <тип курса> <блок>\n'
-             'Пример: /send Русский ОГЭ ПГК 1')
+    reply = (
+        'Файл сохранён, ожидает публикации.\n'
+        'Отправьте на хостинг: /send <предмет> <тип курса> <блок>\n'
+        'Пример: /send Русский ОГЭ ПГК 1\n\n'
+        'Чтобы обновить уже опубликованную ведомость новым файлом, используйте:\n'
+        '/update <название ведомости>\n'
+        'Пример: /update Русский ОГЭ ПГК'
+    )
     if not DRY_RUN:
         msg.reply_text(reply)
     else:
@@ -831,6 +840,262 @@ def send_command(update: Update, context: CallbackContext):
         msg.reply_text('Только админы могут публиковать файлы.')
         return
     _process_send_command(from_id, msg.text or '', msg.reply_text)
+
+def _vk_list_keyboard_json():
+    kb = {
+        "one_time": False,
+        "inline": False,
+        "buttons": [
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "payload": json.dumps({"cmd": "to_list"}, ensure_ascii=False),
+                        "label": "К списку выплат"
+                    },
+                    "color": "primary"
+                }
+            ]
+        ]
+    }
+    return json.dumps(kb, ensure_ascii=False)
+
+def _find_statement_csv_in_folder(statement_folder: str) -> str:
+    for file in os.listdir(statement_folder):
+        if file.lower().endswith('.csv'):
+            return os.path.join(statement_folder, file)
+    return None
+
+def _detect_vk_column(df: pd.DataFrame) -> str:
+    for col in df.columns:
+        if col and str(col).strip().lower() == 'vk_id':
+            return col
+    return None
+
+def _normalize_value(v) -> str:
+    try:
+        s = '' if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+        return s.strip()
+    except Exception:
+        return ''
+
+def _rows_differ(old_row: pd.Series | dict, new_row: pd.Series) -> bool:
+    try:
+        # Compare over intersection of columns
+        if isinstance(old_row, dict):
+            old_keys = set(old_row.keys())
+            def get_old(k):
+                return _normalize_value(old_row.get(k))
+        else:
+            old_keys = set(old_row.index)
+            def get_old(k):
+                return _normalize_value(old_row.get(k))
+        new_keys = set(new_row.index)
+        keys = old_keys.union(new_keys)
+        for k in keys:
+            if _normalize_value(new_row.get(k)) != get_old(k):
+                return True
+        return False
+    except Exception:
+        return True
+
+def update_command(update: Update, context: CallbackContext):
+    """Обновляет уже опубликованную ведомость новым присланным файлом: /update <название ведомости>"""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /update from non-admin %s', from_id)
+        msg.reply_text('Только админы могут обновлять ведомости.')
+        return
+
+    if not context.args:
+        msg.reply_text(
+            'Укажите название ведомости для обновления.\n'
+            'Использование: /update <название ведомости>\n'
+            'Пример: /update Русский ОГЭ ПГК'
+        )
+        return
+
+    statement_name = ' '.join(context.args).strip()
+
+    # Берём последний загруженный файл как источник обновления
+    cur = load_current_for_user(from_id)
+    file_path = cur.get('file_path', '')
+    if not file_path:
+        msg.reply_text('Нет ожидающего файла. Сначала пришлите файл (CSV/XLSX), затем выполните /update <название>.')
+        return
+
+    csv_path = ensure_csv(file_path)
+    if not csv_path:
+        msg.reply_text(f'Не удалось обработать файл {file_path} (чтение/конвертация).')
+        return
+
+    try:
+        # Ищем папку ведомости
+        statement_normalized = statement_name.replace(' ', '_')
+        target_filename = statement_normalized + '.csv'
+        statement_folder = find_statement_folder(target_filename)
+        if not statement_folder:
+            statement_folder = find_statement_folder_flexible(statement_name)
+        if not statement_folder:
+            msg.reply_text(f'Ведомость "{statement_name}" не найдена. Проверьте название (см. /liststatements).')
+            return
+
+        # Определяем путь группового CSV и папку users
+        dest_csv = _find_statement_csv_in_folder(statement_folder)
+        if not dest_csv:
+            msg.reply_text('Не найден файл ведомости в папке. Проверьте структуру.')
+            return
+        users_dir = os.path.join(statement_folder, 'users')
+        os.makedirs(users_dir, exist_ok=True)
+
+        # Загружаем новый CSV
+        try:
+            new_df = pd.read_csv(csv_path, dtype=str)
+        except Exception:
+            new_df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+
+        if new_df is None or new_df.empty:
+            msg.reply_text('Загруженный файл пуст.')
+            return
+
+        vk_col = _detect_vk_column(new_df)
+        if not vk_col:
+            msg.reply_text('В новом файле отсутствует столбец vk_id — обновление невозможно.')
+            return
+
+        # Читаем текущее состояние пользователей этой ведомости из БД
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            c = conn.cursor()
+            # Получаем фактическое имя файла (как хранится в БД)
+            target_filename_db = os.path.basename(dest_csv)
+            c.execute('''
+                SELECT id, vk_id, personal_path, status FROM vedomosti_users
+                WHERE original_filename = ?
+            ''', (target_filename_db,))
+            rows = c.fetchall()
+            # Оставляем по одному (последнему) id на vk_id
+            existing = {}
+            for rid, vk_id_val, ppath, status in rows:
+                key = str(vk_id_val)
+                prev = existing.get(key)
+                if not prev or rid > prev['id']:
+                    existing[key] = {'id': rid, 'vk_id': key, 'personal_path': ppath, 'status': status}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        # Перезаписываем групповой CSV (замена ведомости)
+        try:
+            shutil.copy2(csv_path, dest_csv)
+        except Exception:
+            # Если copy2 не удался, попробуем прочитать/сохранить через pandas для унификации кодировки
+            try:
+                new_df.to_csv(dest_csv, index=False, encoding='utf-8')
+            except Exception as e:
+                log.exception('Failed to overwrite statement CSV: %s', e)
+                msg.reply_text('Не удалось заменить файл ведомости в хостинге.')
+                return
+
+        # Подготовка общего префикса для имён персональных файлов
+        base_original = _safe_filename_component(os.path.splitext(os.path.basename(dest_csv))[0])[:50]
+        timestamp = int(time.time())
+
+        changed_vk_ids: list[str] = []
+        updated_count = 0
+        created_count = 0
+
+        # Обрабатываем каждую строку нового файла
+        for idx, row in new_df.iterrows():
+            try:
+                vk_val = row.get(vk_col, '')
+                if pd.isna(vk_val) or str(vk_val).strip() == '':
+                    continue
+                vk_str = str(vk_val).strip()
+                vk_safe = _safe_filename_component(vk_str)
+
+                # Создаём персональный файл с одной строкой
+                personal_name = f"{vk_safe}_{timestamp}_{idx}_{base_original}.csv"
+                personal_path = os.path.join(users_dir, personal_name)
+                one = new_df.loc[[idx]]
+                try:
+                    one.to_csv(personal_path, index=False, encoding='utf-8')
+                except Exception:
+                    one.to_csv(personal_path, index=False, encoding='cp1251')
+
+                # Сравниваем с предыдущей версией (если была)
+                had_prev = False
+                has_diff = True
+                old_info = existing.get(vk_str)
+                if old_info and old_info.get('personal_path') and os.path.exists(old_info['personal_path']):
+                    had_prev = True
+                    try:
+                        old_df = pd.read_csv(old_info['personal_path'], dtype=str)
+                    except Exception:
+                        try:
+                            old_df = pd.read_csv(old_info['personal_path'], encoding='cp1251', dtype=str)
+                        except Exception:
+                            old_df = None
+                    if isinstance(old_df, pd.DataFrame) and not old_df.empty:
+                        has_diff = _rows_differ(old_df.iloc[0], row)
+
+                # Обновляем БД: меняем personal_path существующей записи, либо создаём новую
+                try:
+                    conn2 = sqlite3.connect(DB_PATH, timeout=30)
+                    c2 = conn2.cursor()
+                    now = int(time.time())
+                    if old_info:
+                        c2.execute('UPDATE vedomosti_users SET personal_path = ? WHERE id = ?', (personal_path, int(old_info['id'])))
+                        updated_count += 1
+                    else:
+                        # Создаём новую запись для этого vk_id в существующей ведомости
+                        archive_time = now + (36 * 3600)
+                        state = f"imported:{uuid.uuid4()}"
+                        c2.execute(
+                            'INSERT INTO vedomosti_users(vk_id, personal_path, original_filename, state, created_at, archive_at) VALUES (?,?,?,?,?,?)',
+                            (vk_str, personal_path, os.path.basename(dest_csv), state, now, archive_time)
+                        )
+                        created_count += 1
+                    conn2.commit()
+                finally:
+                    try:
+                        conn2.close()
+                    except Exception:
+                        pass
+
+                if has_diff:
+                    changed_vk_ids.append(vk_str)
+            except Exception:
+                log.exception('Failed to process update row idx=%s', idx)
+
+        # Оповещаем только тех, у кого изменения
+        notify_text = (
+            'Данные в Вашей выплате были обновлены. '\
+            'Для просмотра нажмите на кнопку "К списку выплат" -> выберите нужную выплату.'
+        )
+        keyboard_json = _vk_list_keyboard_json()
+        sent = 0
+        for vk_id in changed_vk_ids:
+            try:
+                if send_vk_message(vk_id, notify_text, keyboard_json=keyboard_json):
+                    sent += 1
+            except Exception:
+                log.exception('Failed to send VK update notify to %s', vk_id)
+
+        # Очищаем «ожидающий файл»
+        save_current_for_user(from_id, file_path='', awaiting_meta=False)
+
+        msg.reply_text(
+            f'Ведомость "{statement_name}" обновлена.\n'
+            f'Заменён групповой CSV. Пересобрано персональных файлов: {updated_count + created_count}.\n'
+            f'Изменения обнаружены у {len(changed_vk_ids)} пользователей, уведомлено: {sent}.')
+
+    except Exception as e:
+        log.exception('Error in update_command')
+        msg.reply_text(f'Ошибка при обновлении ведомости: {str(e)}')
 
 def addadmin_command(update: Update, context: CallbackContext):
     msg = update.message
@@ -1347,7 +1612,7 @@ def delete_command(update: Update, context: CallbackContext):
         msg.reply_text(f'Ошибка при удалении: {str(e)}')
 
 def unknown(update: Update, context: CallbackContext):
-    update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок>.')
+    update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок> или /update <название ведомости>.')
 
 # ----------------- archive functions -----------------
 
@@ -1577,6 +1842,7 @@ def run_bot():
             BotCommand('send', 'Отправить файл на хостинг: /send <предмет> <тип курса> <блок>'),
             BotCommand('notify', 'Разослать уведомление vk_id из БД'),
             BotCommand('liststatements', 'Показать список открытых и архивных ведомостей'),
+            BotCommand('update', 'Обновить опубликованную ведомость новым файлом: /update <название>'),
             BotCommand('addadmin', 'Добавить админа: /addadmin <username_or_id>'),
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
@@ -1593,6 +1859,7 @@ def run_bot():
     dp.add_handler(CommandHandler('send', send_command))
     dp.add_handler(CommandHandler('notify', notify_command))
     dp.add_handler(CommandHandler('liststatements', liststatements_command))
+    dp.add_handler(CommandHandler('update', update_command))
     dp.add_handler(CommandHandler('addadmin', addadmin_command))
     dp.add_handler(CommandHandler('deladmin', deladmin_command))
     dp.add_handler(CommandHandler('listadmins', listadmins_command))

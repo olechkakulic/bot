@@ -991,6 +991,16 @@ def format_payment_text(data: dict) -> str:
 
         # Итого
         total_section = f"\n\nИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
+
+        # Добавляем комментарий, если он есть (из исходной строки, без fillna('0'))
+        try:
+            original_row = row.iloc[0]
+            comment_val = original_row.get('comment')
+        except Exception:
+            comment_val = p.get('comment', '')
+        comment_str = str(comment_val).strip() if comment_val is not None else ''
+        if comment_str and comment_str.lower() not in ('0', 'nan', 'none'):
+            total_section += f"\n[!!!] Комментарий: {comment_str}"
         
         # Финальная информация
         final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
