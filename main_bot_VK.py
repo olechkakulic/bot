@@ -430,7 +430,6 @@ def _map_row_to_payment_data(row_dict, vk_id, original_filename):
     data['vk_id'] = str(vk_id)
     data['mail'] = pick('Почта', 'mail', 'email', 'Email')
     data['groups'] = pick('Группы', 'groups', 'group', 'groups_list')
-    data['comment'] = pick('Комментарий', 'comment', 'Comment', 'комментарий', 'Комментарий')
     for k in ['total_children','with_tutor','salary_per_student','salary_sum','retention','retention_pay',
               'okk','okk_pay','kpi_sum','checks_calc','checks_sum','extra_checks','support','webinars',
               'chats','group_calls','individual_calls','orders_table','bonus','penalties','total']:
