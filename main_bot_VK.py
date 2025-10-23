@@ -992,6 +992,11 @@ def format_payment_text(data: dict) -> str:
         # Итого
         total_section = f"\n\nИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
         
+        # Добавляем комментарий, если он есть
+        comment = p.get('comment', '')
+        if comment and str(comment).strip():
+            total_section += f"\n[!!!] Комментарий: {comment}"
+        
         # Финальная информация
         final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
                  "\nНажмите «Не согласен», если Вы не согласны с каким-либо из пунктов"
