@@ -925,11 +925,52 @@ def format_payment_text(data: dict) -> str:
             return format_payment_text_fallback(data)
         
         # Находим строку пользователя
-        row = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == vk_id_str)]
+        vk_series = df['vk_id'].fillna('').astype(str).apply(_extract_numeric_vk)
+        row = df[vk_series == vk_id_str]
         if row.empty:
             return format_payment_text_fallback(data)
         
         p = row.fillna('0').iloc[0]
+        
+        # Современный формат с учётом новых столбцов
+        sections = _compose_payment_sections(p)
+        checks_block = sections["checks"]
+        if checks_block:
+            checks_block = "\n[Проверки]" + checks_block
+        extras_block = sections["extras"]
+        if extras_block.startswith("\n[Иная деятельность]"):
+            extras_block = "\n[ Иная деятельность]" + extras_block[len("\n[Иная деятельность]"):]
+        fines_block = sections["fines"]
+        if fines_block.startswith("\n\n→ Штрафы"):
+            fines_block = "\n\n" + fines_block[len("\n\n→ "):]
+        total_block = sections["total"]
+        if total_block.startswith("\n\n→ ИТОГО"):
+            total_block = "\n\n" + total_block[len("\n\n→ "):]
+        
+        groups_str = str(p.get('groups', '')).strip()
+        groups_line = f"\nГруппы: {groups_str}" if groups_str else ""
+        
+        base = (f"=== Согласование выплаты ==="
+                f"\nВедомость: {original_filename.replace('.csv', '')}"
+                f"\nКуратор: {p.get('name', '')}"
+                f"\nТип куратора: {p.get('type', '')}"
+                f"\nПочта на платформе: {p.get('email', '')}"
+                f"{groups_line}\n")
+
+        final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
+                 "\nНажмите «Не согласен», если Вы не согласны с каким-либо из пунктов"
+                 "\nПросмотр ведомости возможен в течение 36 часов")
+
+        msg = (base
+               + sections["studs"]
+               + sections["retention"]
+               + sections["okk"]
+               + checks_block
+               + extras_block
+               + fines_block
+               + total_block
+               + final)
+        return msg
         
         # Используем красивое форматирование как в format_message
         base = (f"=== Согласование выплаты ==="
@@ -992,10 +1033,10 @@ def format_payment_text(data: dict) -> str:
         # Итого
         total_section = f"\n\nИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
         
-        # Добавляем комментарий, если он есть
+        # Добавляем комментарий, если он осмысленный
         comment = p.get('comment', '')
-        if comment and str(comment).strip():
-            total_section += f"\n[!!!] Комментарий: {comment}"
+        if _is_meaningful_comment(comment):
+            total_section += f"\n[!!!] Комментарий: {str(comment).strip()}"
         
         # Финальная информация
         final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
@@ -1013,35 +1054,34 @@ def format_payment_text(data: dict) -> str:
 def format_payment_text_fallback(data: dict) -> str:
     """Простое форматирование выплаты (fallback)."""
     lines = []
-    lines.append("=== Согласование выплаты 💰 ===")
-    lines.append(f"ФИО для консоли: {data.get('fio','')}")
-    lines.append(f"Номер телефона для консоли: {data.get('phone','')}")
-    lines.append(f"Куратор: {data.get('curator','')}")
+    lines.append("=== Согласование выплаты ===")
+    lines.append(f"Номер телефона, который указан в консоли: {data.get('phone','')}")
+    lines.append(f"ФИО, которое указано в консоли: {data.get('console','') or data.get('fio','')}")
+    lines.append(f"Тип куратора: {data.get('type','')}")
+    lines.append(f"Куратор: {data.get('curator','') or data.get('name','')}")
     lines.append(f"vk_id: {data.get('vk_id','')}")
     lines.append(f"Почта: {data.get('mail','')}")
+    if _is_meaningful_comment(data.get('comment')):
+        lines.append(f"Комментарий: {str(data.get('comment')).strip()}")
     lines.append(f"Группы: {data.get('groups','')}")
-    lines.append(f"Всего детей: {data.get('total_children','')}")
-    lines.append(f"Колво учеников с тарифом с репетитором: {data.get('with_tutor','')}")
-    lines.append(f"Оклад за ученика: {data.get('salary_per_student','')}")
-    lines.append(f"Сумма оклада: {data.get('salary_sum','')}")
-    lines.append(f"retention: {data.get('retention','')}")
-    lines.append(f"Оплата за retention: {data.get('retention_pay','')}")
-    lines.append(f"okk: {data.get('okk','')}")
-    lines.append(f"Оплата за okk: {data.get('okk_pay','')}")
-    lines.append(f"Сумма КПИ: {data.get('kpi_sum','')}")
-    lines.append(f"Как считались проверки: {data.get('checks_calc','')}")
-    lines.append(f"Сумма к оплате за проверки: {data.get('checks_sum','')}")
-    lines.append(f"Дополнительные проверки: {data.get('extra_checks','')}")
-    lines.append(f"Учебная поддержка: {data.get('support','')}")
-    lines.append(f"Вебинары: {data.get('webinars','')}")
-    lines.append(f"Чаты: {data.get('chats','')}")
-    lines.append(f"Групповые созвоны: {data.get('group_calls','')}")
-    lines.append(f"Индивидуальные созвоны: {data.get('individual_calls','')}")
-    lines.append(f"Стол заказов: {data.get('orders_table','')}")
-    lines.append(f"Премия от СК: {data.get('bonus','')}")
-    lines.append(f"Штрафы: {data.get('penalties','')}")
-    lines.append(f"Итого: {data.get('total','')}")
-    lines.append(f"\nПросмотр ведомости возможен в течение 36 часов")
+
+    sections = _compose_payment_sections(data)
+    fallback_order = ["studs", "retention", "okk", "checks", "extras", "fines", "total"]
+    for key in fallback_order:
+        block = sections.get(key, "")
+        if not block:
+            continue
+        if key == "checks":
+            block = "\n[Проверки]" + block
+        if key == "extras" and block.startswith("\n[Иная деятельность]"):
+            block = "\n[ Иная деятельность]" + block[len("\n[Иная деятельность]"):]
+        if key == "fines" and block.startswith("\n\n→ Штрафы"):
+            block = "\n\n" + block[len("\n\n→ "):]
+        if key == "total" and block.startswith("\n\n→ ИТОГО"):
+            block = "\n\n" + block[len("\n\n→ "):]
+        lines.append(block)
+
+    lines.append("\nПросмотр ведомости возможен в течение 36 часов")
     return "\n".join(lines)
 
 def map_reason_to_type(reason_label: str) -> str:
@@ -1179,6 +1219,17 @@ def _to_int_safe(value) -> int:
     except Exception:
         return 0
 
+def _to_float_safe(value) -> float:
+    try:
+        if value is None:
+            return 0.0
+        s = str(value).replace('\u00A0', '').replace('\xa0', '').replace(' ', '').replace(',', '.')
+        if s == '' or s.lower() == 'nan':
+            return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
 def _to_float_str_money(value) -> str:
     try:
         if value is None:
@@ -1234,44 +1285,243 @@ def _format_payment_label(original_filename: str, idx: int, max_length: int = 30
     else:
         return f"Ведомость {idx}"
 
-def format_message(file_name, uid, course_type, deadline):
-    csv_path = _find_curator_csv(file_name, uid)
-    if not csv_path:
-        raise FileNotFoundError("CSV for curator not found")
-    try:
-        df = pd.read_csv(csv_path, dtype=str)
-    except Exception:
-        df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
-    if df is None or df.empty:
-        raise ValueError("CSV is empty")
-    if 'vk_id' not in df.columns:
-        raise ValueError("CSV missing vk_id column")
-    row = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == str(uid))]
-    if row.empty:
-        raise ValueError("Curator vk_id not found in CSV")
-    p = row.fillna('0').iloc[0]
+def _extract_numeric_vk(value: str) -> str:
+    """Возвращает числовой VK ID из строки ссылки/ID."""
+    if value is None:
+        return ''
+    s = str(value).strip()
+    if not s:
+        return ''
+    match = re.search(r'(?:vk\.com/id|id)(\d{5,})', s, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r'(\d{5,})', s)
+    if match:
+        return match.group(1)
+    return s
 
-    base = (f"=== Согласование выплаты ==="
-            f"\nКурс: {course_type}"
-            f"\nКуратор: {p.get('name','')}"
-            f"\nТип куратора: {p.get('type','')}"
-            f"\nПочта на платформе: {p.get('email','')}\n")
+def _is_meaningful_comment(comment) -> bool:
+    """Проверяет, содержит ли комментарий полезный текст (не '0', '-', 'nan' и т.п.)."""
+    if comment is None:
+        return False
+    comment_str = str(comment).strip()
+    if not comment_str:
+        return False
+    lowered = comment_str.lower()
+    meaningless_values = {
+        '0', '0.0', '0,0', 'nan', 'none', 'нет', 'no', 'none', 'пусто', 'n/a', 'н/д', '—', '-', '––'
+    }
+    if lowered in meaningless_values:
+        return False
+    if re.fullmatch(r'0+(\.0+)?', lowered):
+        return False
+    stripped = comment_str.strip('-').strip('—').strip()
+    if not stripped:
+        return False
+    return True
 
-    studs_section = ""
+def _compose_payment_sections(p: dict) -> dict:
+    """Строит текстовые блоки для разных разделов выплаты."""
+    sections = {
+        "studs": "",
+        "retention": "",
+        "okk": "",
+        "checks": "",
+        "extras": "",
+        "fines": "",
+        "total": ""
+    }
+
+    def _as_money(value) -> str:
+        return _to_float_str_money(value)
+
+    def _format_percent(value) -> str:
+        if value is None:
+            return ''
+        s = str(value).strip()
+        if not s or s.lower() in ('nan', 'none', '-', '—'):
+            return ''
+        try:
+            has_pct = s.endswith('%')
+            num = float(s.replace('%', '').replace(',', '.'))
+            if not has_pct and abs(num) <= 1:
+                num *= 100
+            num = round(num, 2)
+            if num.is_integer():
+                return f"{int(num)}%"
+            return f"{num}%"
+        except Exception:
+            return s
+
+    # Сопровождение ГК / ГК+
+    stud_gk = _to_int_safe(p.get('stud_gk'))
+    stud_gkp = _to_int_safe(p.get('stud_gkp'))
     stud_all = _to_int_safe(p.get('stud_all'))
-    if stud_all > 0:
-        studs_section = (f"\n[Сопровождение учеников]"
-                         f"\nВсего учеников в группах: {stud_all}"
-                         f"\nСтавка за ученика: {_to_int_safe(p.get('base'))}₽")
-        stud_rep = _to_int_safe(p.get('stud_rep'))
-        if stud_rep > 0:
-            studs_section += (f"\nИз них с репетитором: {stud_rep}"
-                              f"\nДоплата за учеников с репетитором: 50₽ / чел")
-        studs_section += f"\n→ Всего за сопровождение: {_to_int_safe(p.get('stud_salary'))}₽\n"
-        studs_section += (f"\nПоказатель RR: {p.get('rr','')} | KPI за RR: {_to_float_str_money(p.get('rr_salary'))}₽"
-                          f"\nПоказатель ОКК: {p.get('okk','')} | KPI за ОКК: {_to_float_str_money(p.get('okk_salary'))}₽"
-                          f"\n→ Всего KPI (RR+OKK): {_to_float_str_money(p.get('kpi_total'))}\n")
+    stud_rep = _to_int_safe(p.get('stud_rep'))
+    rep_salary = _to_float_str_money(p.get('rep_salary'))
+    base_val = _to_int_safe(p.get('base'))
+    stud_salary_total = _to_int_safe(p.get('stud_salary'))
+    raw_stud_salary_gk = p.get('stud_salary_gk')
+    raw_stud_salary_gkp = p.get('stud_salary_gkp')
+    stud_salary_gk_val = _to_int_safe(raw_stud_salary_gk)
+    stud_salary_gkp_val = _to_int_safe(raw_stud_salary_gkp)
 
+    slivs_gk = _to_int_safe(p.get('slivs_gk'))
+    rr_gk = _format_percent(p.get('rr_gk'))
+    rr_salary_gk = _as_money(p.get('rr_salary_gk'))
+    okk_gk = _format_percent(p.get('okk_gk'))
+    okk_salary_gk = _as_money(p.get('okk_salary_gk'))
+
+    slivs_gkp = _to_int_safe(p.get('slivs_gkp'))
+    rr_gkp = _format_percent(p.get('rr_gkp'))
+    rr_salary_gkp = _as_money(p.get('rr_salary_gkp'))
+    okk_gkp = _format_percent(p.get('okk_gkp'))
+    okk_salary_gkp = _as_money(p.get('okk_salary_gkp'))
+
+    kpi_total_val = _to_float_str_money(p.get('kpi_total'))
+    splitted_blocks = []
+
+    def _append_block(title: str, lines) -> None:
+        if lines:
+            splitted_blocks.append(f"\n{title}\n" + ''.join(lines) + "\n")
+
+    def _has_explicit(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip() != ''
+        return True
+
+    gk_lines = []
+    if stud_gk > 0:
+        gk_lines.append(f"\nВсего учеников - ГК: {stud_gk}")
+    if base_val > 0:
+        gk_lines.append(f"\nОклад за ученика: {base_val}₽")
+    if stud_salary_gk_val > 0 or _has_explicit(raw_stud_salary_gk):
+        gk_lines.append(f"\n→ Сумма оклада: {stud_salary_gk_val}₽")
+    elif stud_salary_total > 0:
+        gk_lines.append(f"\n→ Сумма оклада: {stud_salary_total}₽")
+    if stud_rep > 0:
+        gk_lines.append(f"\nКол-во учеников с тарифом с репетитором: {stud_rep}")
+    if rep_salary != '0' and _to_float_safe(rep_salary) > 0:
+        gk_lines.append(f"\nДоплата за учеников с репетитором: {rep_salary}₽")
+    if slivs_gk > 0:
+        gk_lines.append(f"\nКол-во сливов/киков (ГК): {slivs_gk}")
+    if rr_gk:
+        gk_lines.append(f"\nRetention ГК: {rr_gk}")
+    if rr_salary_gk != '0':
+        gk_lines.append(f"\n→ Оплата за retention ГК: {rr_salary_gk}₽")
+    if okk_gk:
+        gk_lines.append(f"\nOKK ГК: {okk_gk}")
+    if okk_salary_gk != '0':
+        gk_lines.append(f"\n→ Оплата за OKK ГК: {okk_salary_gk}₽")
+    
+    # Calculate KPI for GK - выводим всегда, если есть хотя бы одна из строк оплаты
+    if rr_salary_gk != '0' or okk_salary_gk != '0':
+        kpi_gk = _to_float_safe(rr_salary_gk) + _to_float_safe(okk_salary_gk)
+        kpi_gk_str = _to_float_str_money(kpi_gk)
+        gk_lines.append(f"\n→ Сумма KPI (OKK+Retention): {kpi_gk_str}₽")
+    
+    # Only append block if salary > 0 (not counting base rate)
+    if stud_salary_gk_val > 0 or stud_salary_total > 0:
+        _append_block('[Сопровождение ГК]', gk_lines)
+
+    gkp_lines = []
+    if stud_gkp > 0:
+        gkp_lines.append(f"\nВсего учеников - ГК+: {stud_gkp}")
+    if base_val > 0:
+        gkp_lines.append(f"\nОклад за ученика: {base_val}₽")
+    if stud_salary_gkp_val > 0 or _has_explicit(raw_stud_salary_gkp):
+        gkp_lines.append(f"\n→ Сумма оклада: {stud_salary_gkp_val}₽")
+    if slivs_gkp > 0:
+        gkp_lines.append(f"\nКол-во сливов/киков (ГК+): {slivs_gkp}")
+    if rr_gkp:
+        gkp_lines.append(f"\nRetention ГК+: {rr_gkp}")
+    if rr_salary_gkp != '0':
+        gkp_lines.append(f"\n→ Оплата за retention ГК+: {rr_salary_gkp}₽")
+    if okk_gkp:
+        gkp_lines.append(f"\nOKK ГК+: {okk_gkp}")
+    if okk_salary_gkp != '0':
+        gkp_lines.append(f"\n→ Оплата за OKK ГК+: {okk_salary_gkp}₽")
+    
+    # Calculate KPI for GK+ - выводим всегда, если есть хотя бы одна из строк оплаты
+    if rr_salary_gkp != '0' or okk_salary_gkp != '0':
+        kpi_gkp = _to_float_safe(rr_salary_gkp) + _to_float_safe(okk_salary_gkp)
+        kpi_gkp_str = _to_float_str_money(kpi_gkp)
+        gkp_lines.append(f"\n→ Сумма KPI (OKK+Retention): {kpi_gkp_str}₽")
+    
+    # Only append block if salary > 0 (not counting base rate)
+    if stud_salary_gkp_val > 0:
+        _append_block('[Сопровождение ГК+]', gkp_lines)
+
+    if splitted_blocks:
+        studs_combined = ''.join(splitted_blocks)
+        sections['studs'] = studs_combined
+    elif any(value > 0 for value in (stud_all, stud_rep, stud_salary_total)) or (rep_salary != '0' and _to_float_safe(rep_salary) > 0):
+        # Проверяем, есть ли хотя бы одно ненулевое значение (кроме base_val и kpi_total_val)
+        has_meaningful_data = any(value > 0 for value in (stud_all, stud_rep, stud_salary_total)) or (rep_salary != '0' and _to_float_safe(rep_salary) > 0)
+        if has_meaningful_data:
+            studs_section = "\n[Сопровождение учеников]"
+            if stud_all > 0:
+                studs_section += f"\nВсего учеников в группах: {stud_all}"
+            if stud_rep > 0:
+                studs_section += f"\nКол-во учеников с тарифом с репетитором: {stud_rep}"
+            if base_val > 0:
+                studs_section += f"\nОклад за ученика: {base_val}₽"
+            if rep_salary != '0' and _to_float_safe(rep_salary) > 0:
+                studs_section += f"\nДоплата за учеников с репетитором: {rep_salary}₽"
+            if stud_salary_total > 0:
+                studs_section += f"\n→ Сумма оклада: {stud_salary_total}₽"
+            if kpi_total_val != '0' and _to_float_safe(kpi_total_val) > 0:
+                studs_section += f"\n→ Сумма KPI (OKK+Retention): {kpi_total_val}₽"
+            sections['studs'] = studs_section
+
+    # Retention и OKK (общие блоки показываем только если нет отдельных секций)
+    if not splitted_blocks:
+        # Проверяем, есть ли хотя бы одно ненулевое значение в retention
+        has_retention_data = (
+            slivs_gk > 0 or 
+            (rr_salary_gk != '0' and _to_float_safe(rr_salary_gk) > 0) or
+            slivs_gkp > 0 or 
+            (rr_salary_gkp != '0' and _to_float_safe(rr_salary_gkp) > 0)
+        )
+        if has_retention_data:
+            retention_section = "\n[Retention]"
+            if slivs_gk > 0:
+                retention_section += f"\nКол-во сливов/киков в прошлом блоке ГК: {slivs_gk}"
+            if rr_gk:
+                retention_section += f"\nRetention ГК: {rr_gk}"
+            if rr_salary_gk != '0':
+                retention_section += f"\nОплата за retention ГК: {rr_salary_gk}₽"
+            if slivs_gkp > 0:
+                retention_section += f"\nКол-во сливов/киков в прошлом блоке ГК+: {slivs_gkp}"
+            if rr_gkp:
+                retention_section += f"\nRetention ГК+: {rr_gkp}"
+            if rr_salary_gkp != '0':
+                retention_section += f"\nОплата за retention ГК+: {rr_salary_gkp}₽"
+            sections['retention'] = retention_section
+
+        # Проверяем, есть ли хотя бы одно ненулевое значение в OKK
+        has_okk_data = (
+            (okk_salary_gk != '0' and _to_float_safe(okk_salary_gk) > 0) or
+            (okk_salary_gkp != '0' and _to_float_safe(okk_salary_gkp) > 0) or
+            (kpi_total_val != '0' and _to_float_safe(kpi_total_val) > 0)
+        )
+        if has_okk_data:
+            okk_section = "\n[Показатели ОКК]"
+            if okk_gk:
+                okk_section += f"\nOKK ГК: {okk_gk}"
+            if okk_salary_gk != '0':
+                okk_section += f"\nОплата за OKK ГК: {okk_salary_gk}₽"
+            if okk_gkp:
+                okk_section += f"\nOKK ГК+: {okk_gkp}"
+            if okk_salary_gkp != '0':
+                okk_section += f"\nОплата за OKK ГК+: {okk_salary_gkp}₽"
+            if kpi_total_val != '0' and _to_float_safe(kpi_total_val) > 0:
+                okk_section += f"\n→ Сумма KPI (OKK+Retention): {kpi_total_val}₽"
+            sections['okk'] = okk_section
+
+    # Проверки (существующий блок)
     checks_section = ""
     checks_salary = _to_int_safe(p.get('checks_salary'))
     dop_checks = _to_int_safe(p.get('dop_checks'))
@@ -1281,7 +1531,9 @@ def format_message(file_name, uid, course_type, deadline):
         if dop_checks > 0:
             checks_section += f"\n→ Дополнительно – за проверки (данные СК): {dop_checks}₽"
         checks_section += "\n"
+    sections["checks"] = checks_section
 
+    # Дополнительная деятельность (существующий блок)
     extras_keys = ['up','chats','webs','meth','dop_sk','callsg','callsp']
     extras_names = {
         'up': 'За учебную поддержку',
@@ -1295,28 +1547,108 @@ def format_message(file_name, uid, course_type, deadline):
     extras_total = sum(_to_int_safe(p.get(k)) for k in extras_keys)
     dops_section = ""
     if extras_total > 0:
-        dops_section = "\n[Иная деятельность]"
+        dops_section = "\n\n[Иная деятельность]"
         for k in extras_keys:
             v = _to_int_safe(p.get(k))
             if v > 0:
                 dops_section += f"\n{extras_names[k]}: {v}₽"
         dops_section += f"\n→ Всего в категории: {extras_total}₽"
+    sections["extras"] = dops_section
 
+    # Штрафы (существующий блок)
     fines_val = _to_int_safe(p.get('fines'))
     fines_section = f"\n\n→ Штрафы: -{fines_val}₽" if fines_val > 0 else f"\n\nШтрафы: отсутствуют"
+    sections["fines"] = fines_section
 
+    # Итого + комментарий
     total_section = f"\n\n→ ИТОГО К ВЫПЛАТЕ: {_to_float_str_money(p.get('total'))}₽"
-    
-    # Добавляем комментарий, если он есть
     comment = p.get('comment', '')
-    if comment and str(comment).strip():
-        total_section += f"\n[!!!] Комментарий: {comment}"
+    if _is_meaningful_comment(comment):
+        total_section += f"\n[!!!] Комментарий: {str(comment).strip()}"
+    sections["total"] = total_section
+
+    return sections
+
+def refresh_payment_status_from_db(payment_entry, user_id: int = None):
+    """Обновляет статус выплаты из базы данных и возвращает актуальное значение."""
+    if not os.path.exists(DB_PATH):
+        return payment_entry.get("status")
+    payment_id = payment_entry.get("id") or ""
+    original_payment_id = payment_entry.get("original_payment_id") or ""
+    db_id = payment_entry.get("db_id")
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        row = None
+        if db_id:
+            c.execute("SELECT status FROM vedomosti_users WHERE id = ?", (int(db_id),))
+            row = c.fetchone()
+        else:
+            state_value = None
+            if original_payment_id:
+                state_value = f"imported:{original_payment_id}"
+            elif '_' in payment_id:
+                state_value = f"imported:{payment_id.split('_')[0]}"
+            elif payment_id:
+                state_value = f"imported:{payment_id}"
+            if state_value:
+                if user_id is not None:
+                    c.execute("SELECT status, id FROM vedomosti_users WHERE vk_id = ? AND state = ?", (str(user_id), state_value))
+                else:
+                    c.execute("SELECT status, id FROM vedomosti_users WHERE state = ?", (state_value,))
+                row = c.fetchone()
+        conn.close()
+        if row:
+            if len(row) == 2 and not db_id:
+                payment_entry["db_id"] = row[1]
+                payment_entry["status"] = row[0] or ''
+            else:
+                payment_entry["status"] = row[0] or ''
+        return payment_entry.get("status")
+    except Exception:
+        log.exception("Failed to refresh payment status from DB for payment_id=%s", payment_id)
+        return payment_entry.get("status")
+
+def format_message(file_name, uid, course_type, deadline):
+    csv_path = _find_curator_csv(file_name, uid)
+    if not csv_path:
+        raise FileNotFoundError("CSV for curator not found")
+    try:
+        df = pd.read_csv(csv_path, dtype=str)
+    except Exception:
+        df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+    if df is None or df.empty:
+        raise ValueError("CSV is empty")
+    if 'vk_id' not in df.columns:
+        raise ValueError("CSV missing vk_id column")
+    uid_str = str(uid).strip()
+    vk_series = df['vk_id'].fillna('').astype(str).apply(_extract_numeric_vk)
+    row = df[vk_series == uid_str]
+    if row.empty:
+        raise ValueError("Curator vk_id not found in CSV")
+    p = row.fillna('0').iloc[0]
+
+    base = (f"=== Согласование выплаты ==="
+            f"\nКурс: {course_type}"
+            f"\nКуратор: {p.get('name','')}"
+            f"\nТип куратора: {p.get('type','')}"
+            f"\nПочта на платформе: {p.get('email','')}\n")
+
+    sections = _compose_payment_sections(p)
     
     final = ("\n\nНажмите «Согласен», если у Вас нет разногласий с выставленными цифрами"
              "\nНажмите «Не согласен», если Вы не согласны с каким-либо из пунктов"
              f"\nДедлайн по согласованию выплаты: {deadline}")
 
-    msg = base + studs_section + checks_section + dops_section + fines_section + total_section + final
+    msg = (base
+           + sections["studs"]
+           + sections["retention"]
+           + sections["okk"]
+           + sections["checks"]
+           + sections["extras"]
+           + sections["fines"]
+           + sections["total"]
+           + final)
     phone = p.get('phone', '')
     console = p.get('console', '')
     return (msg, phone, console)
@@ -1733,7 +2065,8 @@ def handle_message_event(event):
             p = find_payment(user_id, sid)
             if p:
                 log.info("User %s trying to open statement %s with status: %s", user_id, sid, p.get("status"))
-                if p.get("status") == "agreed":
+                current_status = refresh_payment_status_from_db(p, user_id)
+                if current_status == "agreed":
                     safe_vk_send(user_id, "Вы уже согласовали ведомость!")
                     log.info("User %s tried to open already confirmed statement %s", user_id, sid)
                     return
