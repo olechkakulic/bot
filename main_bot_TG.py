@@ -22,9 +22,7 @@ import requests
 import pandas as pd
 
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes
 from telegram.ext import filters
 # try load config.py if exists
 try:
@@ -306,6 +304,40 @@ def _safe_filename_component(s: str) -> str:
     s = re.sub(r'__+', '_', s)
     return s[:120] or 'unknown'
 
+def extract_vk_id(vk_value: str) -> Optional[str]:
+    """
+    Извлекает числовой VK ID из строки.
+    Поддерживает форматы:
+    - Просто число: "295942550"
+    - Полная ссылка: "https://vk.com/id295942550"
+    - Короткая ссылка: "vk.com/id295942550"
+    - С пробелами: "https://vk.com/id 295942550"
+    
+    Возвращает числовой ID как строку или None если не удалось извлечь.
+    """
+    if not vk_value:
+        return None
+    
+    vk_str = str(vk_value).strip()
+    if not vk_str:
+        return None
+    
+    # Пробуем извлечь ID из ссылки vk.com/idXXXXX
+    match = re.search(r'(?:vk\.com/id|id)(\d{5,})', vk_str, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # Если это просто число, возвращаем его
+    if re.match(r'^\d{5,}$', vk_str):
+        return vk_str
+    
+    # Пробуем найти любое длинное число (5+ цифр) в строке
+    match = re.search(r'(\d{5,})', vk_str)
+    if match:
+        return match.group(1)
+    
+    return None
+
 def import_users_from_csv(dest_path: str, original_filename: str):
     """Прочитать CSV и для каждой строки с колонкой vk_id создать индивидуальный файл и запись в sqlite."""
     if not os.path.exists(dest_path):
@@ -354,7 +386,14 @@ def import_users_from_csv(dest_path: str, original_filename: str):
             vk_val = row.get(vk_col, '')
             if pd.isna(vk_val) or str(vk_val).strip() == '':
                 continue
-            vk_str = str(vk_val).strip()
+            
+            # Извлекаем числовой ID из значения (может быть ссылка или число)
+            vk_id_extracted = extract_vk_id(str(vk_val))
+            if not vk_id_extracted:
+                log.warning('Could not extract vk_id from value: %s (row %s)', vk_val, idx)
+                continue
+            
+            vk_str = vk_id_extracted
             vk_safe = _safe_filename_component(vk_str)
 
             # Формируем читаемое и короткое имя:
@@ -423,15 +462,22 @@ def send_vk_message(user_vk_id: str, text: str, keyboard_json: Optional[str] = N
     """
     Отправляет сообщение user_vk_id через VK API (community token) с повторными попытками.
     keyboard_json — JSON строка клавиатуры (как возвращает chat_bottom_keyboard()), если None — клавиатура не прикрепляется.
+    Поддерживает как числовой ID, так и ссылки вида https://vk.com/id295942550
     """
     if not VK_TOKEN or not GROUP_ID:
         log.error('VK_TOKEN or GROUP_ID not configured; cannot send VK messages.')
         return False
 
+    # Извлекаем числовой ID из значения (может быть ссылка или число)
+    vk_id_extracted = extract_vk_id(str(user_vk_id))
+    if not vk_id_extracted:
+        log.warning('Invalid vk id (could not extract): %s', user_vk_id)
+        return False
+    
     try:
-        uid = int(str(user_vk_id).strip())
+        uid = int(vk_id_extracted)
     except Exception:
-        log.warning('Invalid vk id (not numeric): %s', user_vk_id)
+        log.warning('Invalid vk id (not numeric after extraction): %s (extracted: %s)', user_vk_id, vk_id_extracted)
         return False
 
     url = 'https://api.vk.com/method/messages.send'
@@ -497,7 +543,7 @@ def send_vk_message(user_vk_id: str, text: str, keyboard_json: Optional[str] = N
 
 # ----------------- Telegram handlers (minor changes) -----------------
 
-def start(update: Update, context: CallbackContext):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     uid = int(user.id)
     save_user_entry(user)
@@ -507,10 +553,10 @@ def start(update: Update, context: CallbackContext):
             save_admins_to_file()
         except Exception:
             log.exception('Failed to persist admin after auto-adding creator')
-        update.message.reply_text('Ты автоматически зарегистрирован(а) как админ (поскольку список админов был пуст).')
+        await update.message.reply_text('Ты автоматически зарегистрирован(а) как админ (поскольку список админов был пуст).')
         log.info('Auto-added admin: %s (%s)', uid, user.username)
 
-    update.message.reply_text(
+    await update.message.reply_text(
         'Привет! Это бот для отправки файлов на хостинг.\n\n'
         'Сценарий работы:\n\n'
         '1) Пришли файл XLSX как вложение.\n'
@@ -524,11 +570,11 @@ def start(update: Update, context: CallbackContext):
         '/update <название ведомости> — обновить данные в существующей ведомости (заменить файл и уведомить пользователей с изменениями)\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
         '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК\n'
-        '/delete <название ведомости> - удалить архивную ведомость полностью\n'
+        '/delete <название1> <название2> ... - удалить одну или несколько архивных ведомостей\n'
     )
 
-def description(update: Update, context: CallbackContext):
-    update.message.reply_text(
+async def description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         'Привет! Это бот для отправки файлов на хостинг.\n\n'
         'Сценарий работы:\n\n'
         '1) Пришли файл XLSX как вложение.\n'
@@ -542,15 +588,15 @@ def description(update: Update, context: CallbackContext):
         '/update <название ведомости> — обновить данные в существующей ведомости (заменить файл и уведомить пользователей с изменениями)\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
         '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК\n'
-        '/delete <название ведомости> - удалить архивную ведомость полностью\n'
+        '/delete <название1> <название2> ... - удалить одну или несколько архивных ведомостей\n'
     )
 
-def handle_document(update: Update, context: CallbackContext):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring document from non-admin %s', from_id)
-        msg.reply_text('Только админы могут загружать файлы.')
+        await msg.reply_text('Только админы могут загружать файлы.')
         return
 
     doc = msg.document
@@ -559,7 +605,7 @@ def handle_document(update: Update, context: CallbackContext):
     filename = doc.file_name or f'document_{doc.file_id}'
     ext = os.path.splitext(filename)[1].lstrip('.').lower()
     if ext not in ALLOWED_EXCEL_EXT:
-        msg.reply_text(f'Неподдерживаемое расширение .{ext}. Поддерживаемые: .xlsx, .xls, .csv')
+        await msg.reply_text(f'Неподдерживаемое расширение .{ext}. Поддерживаемые: .xlsx, .xls, .csv')
         return
 
     os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -568,12 +614,12 @@ def handle_document(update: Update, context: CallbackContext):
     local_path = os.path.join(UPLOADS_DIR, local_name)
 
     try:
-        file_obj = context.bot.get_file(doc.file_id)
-        file_obj.download(custom_path=local_path)
+        file_obj = await context.bot.get_file(doc.file_id)
+        await file_obj.download_to_drive(custom_path=local_path)
         log.info('Downloaded file to %s', local_path)
     except Exception as e:
         log.exception('Failed to download file: %s', e)
-        msg.reply_text('Не удалось загрузить файл. Попробуйте ещё раз.')
+        await msg.reply_text('Не удалось загрузить файл. Попробуйте ещё раз.')
         return
 
     save_current_for_user(from_id, file_path=local_path, awaiting_meta=True)
@@ -583,24 +629,24 @@ def handle_document(update: Update, context: CallbackContext):
              'Пример: /send Русский ОГЭ ПГК\n\n'
              'Для обновления существующей ведомости используйте: /update <название ведомости>')
     if not DRY_RUN:
-        msg.reply_text(reply)
+        await msg.reply_text(reply)
     else:
         log.info('[DRY RUN] %s', reply)
 
 # ----------------- notify handlers -----------------
 
 
-def notify_command(update: Update, context: CallbackContext):
+async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     if not is_admin(user.id):
-        update.message.reply_text('Только админы могут отправлять рассылки.')
+        await update.message.reply_text('Только админы могут отправлять рассылки.')
         return
 
     # Получаем название ведомости, если оно указано
     if context.args:
         subject = ' '.join(context.args).strip()  # Объединяем все аргументы в одну строку
     else:
-        update.message.reply_text('Не указано название ведомости.')
+        await update.message.reply_text('Не указано название ведомости.')
         return
 
     try:
@@ -625,7 +671,7 @@ def notify_command(update: Update, context: CallbackContext):
         conn.close()
     except Exception:
         log.exception('Failed to read vedomosti_users for notify')
-        update.message.reply_text('Ошибка при чтении БД для рассылки. Смотри логи.')
+        await update.message.reply_text('Ошибка при чтении БД для рассылки. Смотри логи.')
         return
 
     vk_ids = [r[0] for r in rows if r and str(r[0]).strip()]
@@ -634,11 +680,11 @@ def notify_command(update: Update, context: CallbackContext):
     total = len(vk_ids)
     
     if total == 0:
-        update.message.reply_text(f'Не найдено пользователей для ведомости "{subject}".\nПроверьте правильность названия ведомости.')
+        await update.message.reply_text(f'Не найдено пользователей для ведомости "{subject}".\nПроверьте правильность названия ведомости.')
         return
     
     # Сообщаем сколько пользователей найдено
-    update.message.reply_text(f'Начинаю рассылку для ведомости "{subject}".\nНайдено пользователей: {total}')
+    await update.message.reply_text(f'Начинаю рассылку для ведомости "{subject}".\nНайдено пользователей: {total}')
     
     sent = 0
     failed = 0
@@ -774,10 +820,10 @@ def notify_command(update: Update, context: CallbackContext):
         column = "\n".join(sample_ids)
         summary += f"\nНе доставлено:\n{column}{more_suffix}"
 
-    update.message.reply_text(summary)
+    await update.message.reply_text(summary)
 # ----------------- other command handlers (unchanged) -----------------
 
-def _process_send_command(from_id: int, text: str, msg_reply_func):
+async def _process_send_command(from_id: int, text: str, msg_reply_func):
     text = (text or '').strip()
     
     # Убираем /send из начала
@@ -787,7 +833,7 @@ def _process_send_command(from_id: int, text: str, msg_reply_func):
     # Разбиваем по пробелам и берем первые 3 части
     parts = text.split()
     if len(parts) < 3:
-        msg_reply_func('Недостаточно параметров. Используйте: /send <предмет> <тип курса> <блок>')
+        await msg_reply_func('Недостаточно параметров. Используйте: /send <предмет> <тип курса> <блок>')
         return
 
     subject = parts[0].strip()
@@ -799,7 +845,7 @@ def _process_send_command(from_id: int, text: str, msg_reply_func):
     if not file_path:
         reply = 'Нет ожидающего файла. Сначала пришлите файл (CSV/XLSX).'
         if not DRY_RUN:
-            msg_reply_func(reply)
+            await msg_reply_func(reply)
         else:
             log.info('[DRY RUN] %s', reply)
         return
@@ -808,7 +854,7 @@ def _process_send_command(from_id: int, text: str, msg_reply_func):
     if not csv_path:
         reply = f'Не удалось обработать файл {file_path} (чтение/конвертация).'
         if not DRY_RUN:
-            msg_reply_func(reply)
+            await msg_reply_func(reply)
         else:
             log.info('[DRY RUN] %s', reply)
         return
@@ -822,25 +868,28 @@ def _process_send_command(from_id: int, text: str, msg_reply_func):
         reply = 'Публикация не удалась.'
 
     if not DRY_RUN:
-        msg_reply_func(reply)
+        await msg_reply_func(reply)
     else:
         log.info('[DRY RUN] %s', reply)
 
-def send_command(update: Update, context: CallbackContext):
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /send from non-admin %s', from_id)
-        msg.reply_text('Только админы могут публиковать файлы.')
+        await msg.reply_text('Только админы могут публиковать файлы.')
         return
-    _process_send_command(from_id, msg.text or '', msg.reply_text)
+    
+    async def reply_func(text):
+        await msg.reply_text(text)
+    await _process_send_command(from_id, msg.text or '', reply_func)
 
-def addadmin_command(update: Update, context: CallbackContext):
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /addadmin from non-admin %s', from_id)
-        msg.reply_text('Только админы могут добавлять админов.')
+        await msg.reply_text('Только админы могут добавлять админов.')
         return
 
     target_id = None
@@ -852,7 +901,7 @@ def addadmin_command(update: Update, context: CallbackContext):
     else:
         m = re.match(r'^\s*/addadmin\s+(.+)$', text, flags=re.IGNORECASE)
         if not m:
-            msg.reply_text('Использование: /addadmin <username_or_id>')
+            await msg.reply_text('Использование: /addadmin <username_or_id>')
             return
         target = m.group(1).strip()
         if re.fullmatch(r'\d+', target):
@@ -862,7 +911,7 @@ def addadmin_command(update: Update, context: CallbackContext):
                 target = target[1:]
             username = target
             try:
-                chat = context.bot.get_chat(f"@{username}")
+                chat = await context.bot.get_chat(f"@{username}")
                 target_id = int(chat.id)
                 log.info('Resolved @%s via get_chat -> id=%s', username, target_id)
             except Exception as e:
@@ -878,7 +927,7 @@ def addadmin_command(update: Update, context: CallbackContext):
                     target_id = None
 
     if not target_id:
-        msg.reply_text(
+        await msg.reply_text(
             'Не удалось определить пользователя. Убедитесь, что:\n'
             '- вы ответили на сообщение пользователя и вызвали /addadmin, или\n'
             '- указали числовой id, или\n'
@@ -888,7 +937,7 @@ def addadmin_command(update: Update, context: CallbackContext):
         return
 
     if int(target_id) in ADMIN_IDS:
-        msg.reply_text(f'Пользователь id={target_id} уже является админом.')
+        await msg.reply_text(f'Пользователь id={target_id} уже является админом.')
         return
 
     ADMIN_IDS.add(int(target_id))
@@ -896,14 +945,14 @@ def addadmin_command(update: Update, context: CallbackContext):
         save_admins_to_file()
     except Exception:
         log.exception('Failed to persist admins after adding %s', target_id)
-    msg.reply_text(f'Пользователь id={target_id} добавлен в админы.')
+    await msg.reply_text(f'Пользователь id={target_id} добавлен в админы.')
 
-def deladmin_command(update: Update, context: CallbackContext):
+async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /deladmin from non-admin %s', from_id)
-        msg.reply_text('Только админы могут удалять админов.')
+        await msg.reply_text('Только админы могут удалять админов.')
         return
 
     target_id = None
@@ -915,7 +964,7 @@ def deladmin_command(update: Update, context: CallbackContext):
     else:
         m = re.match(r'^\s*/deladmin\s+(.+)$', text, flags=re.IGNORECASE)
         if not m:
-            msg.reply_text('Использование: /deladmin <username_or_id>')
+            await msg.reply_text('Использование: /deladmin <username_or_id>')
             return
         target = m.group(1).strip()
         if re.fullmatch(r'\d+', target):
@@ -925,7 +974,7 @@ def deladmin_command(update: Update, context: CallbackContext):
                 target = target[1:]
             username = target
             try:
-                chat = context.bot.get_chat(f"@{username}")
+                chat = await context.bot.get_chat(f"@{username}")
                 target_id = int(chat.id)
                 log.info('Resolved @%s via get_chat -> id=%s', username, target_id)
             except Exception as e:
@@ -941,7 +990,7 @@ def deladmin_command(update: Update, context: CallbackContext):
                     target_id = None
 
     if not target_id:
-        msg.reply_text(
+        await msg.reply_text(
             'Не удалось определить пользователя. Убедитесь, что:\n'
             '- вы ответили на сообщение пользователя и вызвали /deladmin, или\n'
             '- указали числовой id, или\n'
@@ -950,11 +999,11 @@ def deladmin_command(update: Update, context: CallbackContext):
         return
 
     if int(target_id) not in ADMIN_IDS:
-        msg.reply_text(f'Пользователь id={target_id} не является админом.')
+        await msg.reply_text(f'Пользователь id={target_id} не является админом.')
         return
 
     if len(ADMIN_IDS) <= 1:
-        msg.reply_text('Нельзя удалить последнего админа — сначала добавьте другого админа.')
+        await msg.reply_text('Нельзя удалить последнего админа — сначала добавьте другого админа.')
         return
 
     ADMIN_IDS.discard(int(target_id))
@@ -962,18 +1011,18 @@ def deladmin_command(update: Update, context: CallbackContext):
         save_admins_to_file()
     except Exception:
         log.exception('Failed to persist admins after removing %s', target_id)
-    msg.reply_text(f'Пользователь id={target_id} удалён из админов.')
+    await msg.reply_text(f'Пользователь id={target_id} удалён из админов.')
 
-def listadmins_command(update: Update, context: CallbackContext):
+async def listadmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /listadmins from non-admin %s', from_id)
-        msg.reply_text('Только админы могут просматривать список админов.')
+        await msg.reply_text('Только админы могут просматривать список админов.')
         return
 
     if not ADMIN_IDS:
-        msg.reply_text('Список админов пуст.')
+        await msg.reply_text('Список админов пуст.')
         return
 
     users = load_users()
@@ -986,15 +1035,15 @@ def listadmins_command(update: Update, context: CallbackContext):
             lines.append(str(aid))
 
     text = 'Текущий список админов:\n' + '\n'.join(lines)
-    msg.reply_text(text)
+    await msg.reply_text(text)
 
-def liststatements_command(update: Update, context: CallbackContext):
+async def liststatements_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /liststatements — показывает все открытые и архивные ведомости."""
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /liststatements from non-admin %s', from_id)
-        msg.reply_text('Только админы могут просматривать список ведомостей.')
+        await msg.reply_text('Только админы могут просматривать список ведомостей.')
         return
 
     try:
@@ -1072,11 +1121,11 @@ def liststatements_command(update: Update, context: CallbackContext):
         if len(response) > 4000:
             response = response[:4000] + '\n...(список обрезан)'
         
-        msg.reply_text(response)
+        await msg.reply_text(response)
         
     except Exception as e:
         log.exception('Error in liststatements_command')
-        msg.reply_text(f'Ошибка при получении списка ведомостей: {str(e)}')
+        await msg.reply_text(f'Ошибка при получении списка ведомостей: {str(e)}')
 
 
 def get_archive_time_for_file(filename: str) -> int:
@@ -1096,18 +1145,18 @@ def get_archive_time_for_file(filename: str) -> int:
         return 0
 
 
-def archive_command(update: Update, context: CallbackContext):
+async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для ручной архивации конкретной ведомости: /archive <название ведомости>"""
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /archive from non-admin %s', from_id)
-        msg.reply_text('Только админы могут архивировать ведомости.')
+        await msg.reply_text('Только админы могут архивировать ведомости.')
         return
 
     # Получаем название ведомости
     if not context.args:
-        msg.reply_text(
+        await msg.reply_text(
             'Укажите название ведомости для архивации.\n'
             'Использование: /archive <название ведомости>\n'
             'Пример: /archive Русский ОГЭ ПГК\n\n'
@@ -1131,13 +1180,13 @@ def archive_command(update: Update, context: CallbackContext):
                 target_filename = os.path.basename([f for f in os.listdir(statement_folder) if f.endswith('.csv')][0])
         
         if not statement_folder:
-            msg.reply_text(f'Ведомость "{statement_name}" не найдена в открытых папках.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
+            await msg.reply_text(f'Ведомость "{statement_name}" не найдена в открытых папках.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
             return
         
         # Проверяем есть ли пользователи этой ведомости в БД
         users_count = count_users_in_statement(target_filename)
         
-        msg.reply_text(f'Начинаю архивацию ведомости "{statement_name}".\nНайдено пользователей в БД: {users_count}')
+        await msg.reply_text(f'Начинаю архивацию ведомости "{statement_name}".\nНайдено пользователей в БД: {users_count}')
         
         # Выполняем архивацию
         success = archive_statement_manually(target_filename, statement_folder)
@@ -1145,17 +1194,17 @@ def archive_command(update: Update, context: CallbackContext):
         if success:
             # Удаляем пользователей из БД
             removed_count = remove_users_from_statement(target_filename)
-            msg.reply_text(
+            await msg.reply_text(
                 f'Ведомость "{statement_name}" успешно заархивирована.\n'
                 f'Папка перемещена в архив.\n'
                 f'Удалено записей из БД: {removed_count}'
             )
         else:
-            msg.reply_text(f'Ошибка при архивации ведомости "{statement_name}". Проверьте логи.')
+            await msg.reply_text(f'Ошибка при архивации ведомости "{statement_name}". Проверьте логи.')
             
     except Exception as e:
         log.exception('Error in manual archive command')
-        msg.reply_text(f'Ошибка при архивации: {str(e)}')
+        await msg.reply_text(f'Ошибка при архивации: {str(e)}')
 
 
 def find_statement_folder(filename: str) -> str:
@@ -1246,12 +1295,26 @@ def archive_statement_manually(filename: str, statement_folder: str) -> bool:
 
 
 def remove_users_from_statement(filename: str) -> int:
-    """Удаляет всех пользователей указанной ведомости из БД."""
+    """Удаляет всех пользователей указанной ведомости из БД. Ищет по точному совпадению и без учета регистра."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
+        
+        # Сначала пробуем точное совпадение
         c.execute('DELETE FROM vedomosti_users WHERE original_filename = ?', (filename,))
         affected = c.rowcount
+        
+        # Если не нашли, пробуем без учета регистра
+        if affected == 0:
+            c.execute('DELETE FROM vedomosti_users WHERE LOWER(original_filename) = LOWER(?)', (filename,))
+            affected = c.rowcount
+        
+        # Если все еще не нашли, пробуем найти по частичному совпадению (без расширения)
+        if affected == 0:
+            filename_base = os.path.splitext(filename)[0]
+            c.execute('DELETE FROM vedomosti_users WHERE LOWER(original_filename) LIKE LOWER(?)', (f'%{filename_base}%',))
+            affected = c.rowcount
+        
         conn.commit()
         conn.close()
         log.info('Removed %d users for statement %s from database', affected, filename)
@@ -1263,6 +1326,20 @@ def remove_users_from_statement(filename: str) -> int:
 def update_statement_data(statement_folder: str, target_filename: str, new_csv_path: str) -> tuple[bool, list]:
     """Обновляет данные ведомости новым CSV файлом и возвращает список пользователей с изменениями."""
     try:
+        def _normalize_value(val):
+            if pd.isna(val) or val is None:
+                return ''
+            return str(val).strip()
+
+        def _get_field(row_dict: dict, field_name: str):
+            if field_name in row_dict:
+                return row_dict.get(field_name)
+            target = field_name.strip().lower()
+            for key, value in row_dict.items():
+                if str(key).strip().lower() == target:
+                    return value
+            return ''
+
         # Читаем новый CSV файл
         try:
             new_df = pd.read_csv(new_csv_path, dtype=str)
@@ -1323,15 +1400,21 @@ def update_statement_data(statement_folder: str, target_filename: str, new_csv_p
             old_row = old_data.get(vk_id, {})
             
             # Сравниваем ключевые поля (исключаем служебные поля)
-            key_fields = ['name', 'type', 'email', 'stud_all', 'stud_rep', 'base', 'stud_salary', 
-                         'rr', 'rr_salary', 'okk', 'okk_salary', 'kpi_total', 'checks_salary', 
-                         'dop_checks', 'up', 'chats', 'webs', 'meth', 'dop_sk', 'callsg', 'callsp', 
-                         'fines', 'total', 'comment']
+            key_fields = [
+                'name', 'type', 'email', 'phone', 'console', 'groups',
+                'stud_all', 'stud_gk', 'stud_gkp', 'stud_rep', 'rep_salary', 'base', 'stud_salary',
+                'slivs', 'slivs_gk', 'slivs_gkp',
+                'rr', 'rr_salary', 'rr_gk', 'rr_salary_gk', 'rr_gkp', 'rr_salary_gkp',
+                'okk', 'okk_salary', 'okk_gk', 'okk_salary_gk', 'okk_gkp', 'okk_salary_gkp',
+                'kpi_total', 'checks_all', 'checks_prev', 'checks_salary', 'dop_checks',
+                'up', 'chats', 'webs', 'meth', 'dop_sk', 'callsg', 'callsp',
+                'fines', 'total', 'comment'
+            ]
             
             has_changes = False
             for field in key_fields:
-                old_val = str(old_row.get(field, '')).strip()
-                new_val = str(new_row.get(field, '')).strip()
+                old_val = _normalize_value(_get_field(old_row, field))
+                new_val = _normalize_value(_get_field(new_row, field))
                 if old_val != new_val:
                     has_changes = True
                     break
@@ -1366,7 +1449,7 @@ def update_statement_data(statement_folder: str, target_filename: str, new_csv_p
             log.exception('Failed to replace main CSV file %s', old_csv_path)
             return False, []
         
-        # Обновляем записи в БД (обновляем personal_path если нужно)
+        # Обновляем записи в БД (обновляем personal_path и снимаем согласованность для пользователей с изменениями)
         try:
             conn = sqlite3.connect(DB_PATH, timeout=30)
             c = conn.cursor()
@@ -1382,15 +1465,28 @@ def update_statement_data(statement_folder: str, target_filename: str, new_csv_p
                     personal_files.sort(key=lambda x: os.path.getctime(os.path.join(users_dir, x)), reverse=True)
                     new_personal_path = os.path.join(users_dir, personal_files[0])
                     
-                    # Обновляем personal_path в БД
-                    c.execute('UPDATE vedomosti_users SET personal_path = ? WHERE vk_id = ? AND original_filename = ?',
+                    # Обновляем personal_path и снимаем согласованность (сбрасываем status, disagree_reason, confirmed_at)
+                    c.execute('''UPDATE vedomosti_users 
+                                 SET personal_path = ?, status = NULL, disagree_reason = NULL, confirmed_at = NULL 
+                                 WHERE vk_id = ? AND original_filename = ?''',
                              (new_personal_path, vk_id, target_filename))
+                    affected = c.rowcount
+                    log.info('Reset agreement status for vk_id=%s in statement %s (affected rows: %d)', vk_id, target_filename, affected)
+                    
+                    # Если не нашлось по точному совпадению, пробуем без расширения
+                    if affected == 0:
+                        c.execute('''UPDATE vedomosti_users 
+                                     SET personal_path = ?, status = NULL, disagree_reason = NULL, confirmed_at = NULL 
+                                     WHERE vk_id = ? AND (original_filename = ? OR original_filename = ?)''',
+                                 (new_personal_path, vk_id, target_filename.replace('.csv', ''), target_filename))
+                        affected = c.rowcount
+                        log.info('Second attempt: Reset agreement status for vk_id=%s (affected rows: %d)', vk_id, affected)
             
             conn.commit()
             conn.close()
-            log.info('Updated personal_path in database for %d users', len(updated_users))
+            log.info('Updated personal_path and reset agreement status in database for %d users', len(updated_users))
         except Exception:
-            log.exception('Failed to update personal_path in database')
+            log.exception('Failed to update personal_path and reset agreement status in database')
         
         return True, updated_users
         
@@ -1447,106 +1543,186 @@ def send_update_notifications(updated_users: list, statement_name: str):
     log.info('Update notifications sent: success=%d, failed=%d', sent, failed)
 
 
-def delete_command(update: Update, context: CallbackContext):
-    """Команда для удаления архивной ведомости: /delete <название ведомости>"""
+def find_archived_statement(statement_name: str) -> tuple:
+    """Находит архивную ведомость по названию. Возвращает (statement_folder, target_filename) или (None, None)"""
+    archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+    
+    if not os.path.exists(archive_path):
+        return None, None
+    
+    # Очищаем название от возможных символов маркера списка
+    statement_name = statement_name.strip().lstrip('•').strip()
+    
+    # Ищем точное совпадение
+    for root, dirs, files in os.walk(archive_path):
+        if 'users' in root:
+            continue
+        for file in files:
+            if file.endswith('.csv'):
+                file_base = os.path.splitext(file)[0]
+                if file_base == statement_name or file == statement_name:
+                    return root, file
+    
+    # Если не нашли точное совпадение, ищем по частичному совпадению
+    for root, dirs, files in os.walk(archive_path):
+        if 'users' in root:
+            continue
+        for file in files:
+            if file.endswith('.csv'):
+                file_base = os.path.splitext(file)[0]
+                if statement_name.lower() in file_base.lower() or file_base.lower() in statement_name.lower():
+                    return root, file
+    
+    return None, None
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для удаления архивных ведомостей: /delete <название1> <название2> ... или многострочный список"""
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /delete from non-admin %s', from_id)
-        msg.reply_text('Только админы могут удалять ведомости.')
+        await msg.reply_text('Только админы могут удалять ведомости.')
         return
-
-    # Получаем название ведомости
-    if not context.args:
-        msg.reply_text(
-            'Укажите название ведомости для удаления.\n'
-            'Использование: /delete <название ведомости>\n'
-            'Пример: /delete Хим_Катя_ГК_1блок\n\n'
+    
+    # Получаем список ведомостей для удаления
+    if not context.args and not msg.text:
+        await msg.reply_text(
+            'Укажите название ведомости(ей) для удаления.\n'
+            'Использование: /delete <название1> <название2> ...\n'
+            'Пример: /delete Хим_Катя_ГК_1блок Физика_ОГЭ_ПГК_3\n\n'
+            'Можно указать несколько ведомостей через пробел.\n'
+            'Также можно вставить список с символами • (маркеры списка будут автоматически удалены).\n\n'
             'Для просмотра доступных ведомостей используйте /liststatements'
         )
         return
     
-    statement_name = ' '.join(context.args).strip()
+    # Получаем текст команды (все после /delete)
+    command_text = msg.text or ''
+    if command_text.startswith('/delete'):
+        command_text = command_text[7:].strip()  # Убираем "/delete"
+    
+    # Если есть аргументы из context.args, используем их
+    if context.args:
+        statement_names = context.args
+    else:
+        # Парсим текст - разбиваем по строкам и убираем пустые
+        lines = [line.strip() for line in command_text.split('\n') if line.strip()]
+        statement_names = []
+        for line in lines:
+            # Убираем маркеры списка (•, -, *, и пробелы в начале) и очищаем
+            cleaned_line = line.lstrip('•').lstrip('-').lstrip('*').lstrip().strip()
+            # Пропускаем пустые строки или строки только с маркерами
+            if not cleaned_line or cleaned_line == '•' or cleaned_line == '-' or cleaned_line == '*':
+                continue
+            # Если строка содержит .csv, оставляем как есть, иначе разбиваем по пробелам
+            if '.csv' in cleaned_line:
+                # Убираем .csv если есть (будем искать с ним и без)
+                name_without_ext = cleaned_line.replace('.csv', '').strip()
+                if name_without_ext:
+                    statement_names.append(name_without_ext)
+            else:
+                # Разбиваем на отдельные названия (если в строке несколько)
+                parts = cleaned_line.split()
+                statement_names.extend([p for p in parts if p and p not in ('•', '-', '*')])
+    
+    if not statement_names:
+        await msg.reply_text('Не указаны ведомости для удаления.')
+        return
+    
+    # Удаляем дубликаты, сохраняя порядок, и фильтруем пустые значения
+    statement_names = [name for name in dict.fromkeys(statement_names) if name and name.strip()]
+    
+    total_to_delete = len(statement_names)
+    await msg.reply_text(f'Начинаю удаление {total_to_delete} архивных ведомостей...')
+    
+    archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
+    results = {
+        'success': [],
+        'not_found': [],
+        'errors': []
+    }
     
     try:
-        # Ищем ведомость в архивных папках
-        archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
-        statement_folder = None
-        target_filename = None
-        
-        if os.path.exists(archive_path):
-            # Ищем точное совпадение
-            for root, dirs, files in os.walk(archive_path):
-                if 'users' in root:
-                    continue
-                for file in files:
-                    if file.endswith('.csv'):
-                        file_base = os.path.splitext(file)[0]
-                        if file_base == statement_name or file == statement_name:
-                            statement_folder = root
-                            target_filename = file
-                            break
-                if statement_folder:
-                    break
+        for statement_name in statement_names:
+            statement_folder, target_filename = find_archived_statement(statement_name)
             
-            # Если не нашли точное совпадение, ищем по частичному совпадению
-            if not statement_folder:
-                for root, dirs, files in os.walk(archive_path):
-                    if 'users' in root:
-                        continue
-                    for file in files:
-                        if file.endswith('.csv'):
-                            file_base = os.path.splitext(file)[0]
-                            if statement_name.lower() in file_base.lower() or file_base.lower() in statement_name.lower():
-                                statement_folder = root
-                                target_filename = file
-                                break
-                    if statement_folder:
-                        break
+            if not statement_folder or not target_filename:
+                results['not_found'].append(statement_name)
+                log.warning('Archived statement not found: %s', statement_name)
+                continue
+            
+            try:
+                # Подсчитываем количество пользователей в БД
+                users_count = count_users_in_statement(target_filename)
+                
+                # Удаляем папку с ведомостью
+                shutil.rmtree(statement_folder)
+                log.info('Deleted archived statement folder: %s', statement_folder)
+                
+                # Удаляем записи из БД
+                removed_count = remove_users_from_statement(target_filename)
+                
+                results['success'].append({
+                    'name': statement_name,
+                    'filename': target_filename,
+                    'folder': statement_folder,
+                    'users_count': users_count,
+                    'removed_count': removed_count
+                })
+                
+            except Exception as e:
+                log.exception('Failed to delete archived statement %s: %s', statement_name, e)
+                results['errors'].append({
+                    'name': statement_name,
+                    'error': str(e)
+                })
         
-        if not statement_folder or not target_filename:
-            msg.reply_text(f'Архивная ведомость "{statement_name}" не найдена.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
-            return
+        # Формируем итоговый отчет
+        report_lines = [f'Удаление завершено. Обработано: {total_to_delete} ведомостей\n']
         
-        # Подсчитываем количество пользователей в БД
-        users_count = count_users_in_statement(target_filename)
+        if results['success']:
+            report_lines.append(f'\nУспешно удалено: {len(results["success"])}')
+            for item in results['success']:
+                removed_info = f'удалено записей из БД: {item["removed_count"]}'
+                if item["removed_count"] == 0:
+                    removed_info += ' (записей не было в БД или уже удалены)'
+                report_lines.append(f'  • {item["name"]} ({removed_info})')
         
-        msg.reply_text(f'Начинаю удаление архивной ведомости "{statement_name}".\nНайдено пользователей в БД: {users_count}')
+        if results['not_found']:
+            report_lines.append(f'\nНе найдено: {len(results["not_found"])}')
+            for name in results['not_found']:
+                report_lines.append(f'  • {name}')
         
-        # Удаляем папку с ведомостью
-        try:
-            shutil.rmtree(statement_folder)
-            log.info('Deleted archived statement folder: %s', statement_folder)
-        except Exception as e:
-            log.exception('Failed to delete archived statement folder %s: %s', statement_folder, e)
-            msg.reply_text(f'Ошибка при удалении папки ведомости: {str(e)}')
-            return
+        if results['errors']:
+            report_lines.append(f'\nОшибки при удалении: {len(results["errors"])}')
+            for item in results['errors']:
+                report_lines.append(f'  • {item["name"]}: {item["error"]}')
         
-        # Удаляем записи из БД
-        removed_count = remove_users_from_statement(target_filename)
+        report = '\n'.join(report_lines)
         
-        msg.reply_text(
-            f'Архивная ведомость "{statement_name}" успешно удалена.\n'
-            f'Папка удалена: {statement_folder}\n'
-            f'Удалено записей из БД: {removed_count}'
-        )
+        # Telegram ограничивает длину сообщений до 4096 символов
+        if len(report) > 4000:
+            report = report[:4000] + '\n...(отчет обрезан)'
+        
+        await msg.reply_text(report)
         
     except Exception as e:
         log.exception('Error in delete command')
-        msg.reply_text(f'Ошибка при удалении: {str(e)}')
+        await msg.reply_text(f'Критическая ошибка при удалении: {str(e)}')
 
-def update_command(update: Update, context: CallbackContext):
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для обновления ведомости: /update <название ведомости>"""
     msg = update.message
     from_id = msg.from_user.id
     if not is_admin(from_id):
         log.info('Ignoring /update from non-admin %s', from_id)
-        msg.reply_text('Только админы могут обновлять ведомости.')
+        await msg.reply_text('Только админы могут обновлять ведомости.')
         return
 
     # Получаем название ведомости
     if not context.args:
-        msg.reply_text(
+        await msg.reply_text(
             'Укажите название ведомости для обновления.\n'
             'Использование: /update <название ведомости>\n'
             'Пример: /update Русский ОГЭ ПГК\n\n'
@@ -1569,7 +1745,7 @@ def update_command(update: Update, context: CallbackContext):
                         target_filename = file
                         break
             else:
-                msg.reply_text(f'Ведомость "{statement_name}" не найдена в открытых папках.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
+                await msg.reply_text(f'Ведомость "{statement_name}" не найдена в открытых папках.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
                 return
         else:
             target_filename = statement_name + '.csv'
@@ -1578,13 +1754,13 @@ def update_command(update: Update, context: CallbackContext):
         cur = load_current_for_user(from_id)
         file_path = cur.get('file_path', '')
         if not file_path:
-            msg.reply_text('Нет ожидающего файла для обновления. Сначала пришлите новый файл (CSV/XLSX).')
+            await msg.reply_text('Нет ожидающего файла для обновления. Сначала пришлите новый файл (CSV/XLSX).')
             return
         
         # Конвертируем файл в CSV
         csv_path = ensure_csv(file_path)
         if not csv_path:
-            msg.reply_text(f'Не удалось обработать файл {file_path} (чтение/конвертация).')
+            await msg.reply_text(f'Не удалось обработать файл {file_path} (чтение/конвертация).')
             return
         
         # Выполняем обновление
@@ -1598,20 +1774,20 @@ def update_command(update: Update, context: CallbackContext):
             if updated_users:
                 send_update_notifications(updated_users, statement_name)
             
-            msg.reply_text(
+            await msg.reply_text(
                 f'Ведомость "{statement_name}" успешно обновлена.\n'
                 f'Обновлено пользователей: {len(updated_users)}\n'
                 f'Уведомления отправлены пользователям с изменениями.'
             )
         else:
-            msg.reply_text(f'Ошибка при обновлении ведомости "{statement_name}". Проверьте логи.')
+            await msg.reply_text(f'Ошибка при обновлении ведомости "{statement_name}". Проверьте логи.')
             
     except Exception as e:
         log.exception('Error in update command')
-        msg.reply_text(f'Ошибка при обновлении: {str(e)}')
+        await msg.reply_text(f'Ошибка при обновлении: {str(e)}')
 
-def unknown(update: Update, context: CallbackContext):
-    update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок>.')
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок>.')
 
 # ----------------- archive functions -----------------
 
@@ -1831,8 +2007,9 @@ def run_bot():
     archive_thread = threading.Thread(target=archive_worker, daemon=True)
     archive_thread.start()
     log.info('Archive worker thread started')
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    
+    # Create application with bot token
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     try:
         commands = [
@@ -1846,30 +2023,29 @@ def run_bot():
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
             BotCommand('archive', 'Переместить ведомость в архив: /archive <название>'),
-            BotCommand('delete', 'Удалить архивную ведомость: /delete <название>')
+            BotCommand('delete', 'Удалить архивные ведомости: /delete <название1> <название2> ...')
         ]
-        updater.bot.set_my_commands(commands)
+        application.bot.set_my_commands(commands)
         log.info('Bot commands (menu) set: %s', [c.command for c in commands])
     except Exception as e:
         log.exception('Failed to set bot commands: %s', e)
 
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(CommandHandler('description', description))
-    dp.add_handler(CommandHandler('send', send_command))
-    dp.add_handler(CommandHandler('update', update_command))
-    dp.add_handler(CommandHandler('notify', notify_command))
-    dp.add_handler(CommandHandler('liststatements', liststatements_command))
-    dp.add_handler(CommandHandler('addadmin', addadmin_command))
-    dp.add_handler(CommandHandler('deladmin', deladmin_command))
-    dp.add_handler(CommandHandler('listadmins', listadmins_command))
-    dp.add_handler(CommandHandler('archive', archive_command))
-    dp.add_handler(CommandHandler('delete', delete_command))
-    dp.add_handler(MessageHandler(Filters.document, handle_document))
-    dp.add_handler(MessageHandler(Filters.command, unknown))
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('description', description))
+    application.add_handler(CommandHandler('send', send_command))
+    application.add_handler(CommandHandler('update', update_command))
+    application.add_handler(CommandHandler('notify', notify_command))
+    application.add_handler(CommandHandler('liststatements', liststatements_command))
+    application.add_handler(CommandHandler('addadmin', addadmin_command))
+    application.add_handler(CommandHandler('deladmin', deladmin_command))
+    application.add_handler(CommandHandler('listadmins', listadmins_command))
+    application.add_handler(CommandHandler('archive', archive_command))
+    application.add_handler(CommandHandler('delete', delete_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     log.info('Telegram payroll hosting bot started (DRY_RUN=%s)', DRY_RUN)
-    updater.start_polling()
-    updater.idle()
+    application.run_polling()
 
 if __name__ == '__main__':
     run_bot()
