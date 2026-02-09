@@ -44,6 +44,7 @@ user_payments_lock = threading.RLock()
 _csv_cache = {}
 _cache_timestamps = {}
 GSHEET_ID = "16ieoQC7N1lnmdMuonO3c7qdn_zmydptFYvRGSCjeLFg"
+REPET_GSHEET_ID = "1UQMNS3yhFNCDyXS2E03y9iZX2zsHsoL3KKATo-e5c5Q"  # Таблица для репетиторов
 _gspread_client = None
 
 def ensure_db_indexes():
@@ -210,23 +211,66 @@ def get_gspread_client():
         log.exception("Failed to init gspread client: %s", str(e))
         return None
 
-def log_complaint_to_sheet(vk_id: int, reason: str, filename: str = "", filepath: str = ""):
+def log_complaint_to_sheet(vk_id: int, reason: str, filename: str = "", filepath: str = "", fio: str = ""):
     try:
         log.info("Attempting to log complaint: vk_id=%s reason=%s filename=%s", vk_id, reason, filename)
         client = get_gspread_client()
         if not client:
             log.error("Failed to get gspread client")
             return
+        fio_val = fio or ""
+        if not fio_val:
+            try:
+                pays = get_payments_for_user(vk_id)
+                if pays:
+                    fio_val = pays[0].get("data", {}).get("fio") or pays[0].get("data", {}).get("curator") or ""
+                if not fio_val:
+                    allp = get_all_payments_for_user_from_db(vk_id, limit=1)
+                    if allp:
+                        fio_val = allp[0].get("data", {}).get("fio") or allp[0].get("data", {}).get("curator") or ""
+            except Exception:
+                fio_val = fio_val or ""
         log.info("Got gspread client, opening sheet with ID=%s", GSHEET_ID)
         sh = client.open_by_key(GSHEET_ID)
         ws = sh.sheet1
         dialog_link = f"https://vk.com/gim{GROUP_ID}?sel={vk_id}"
-        row_data = [time.strftime('%Y-%m-%d %H:%M:%S'), str(vk_id), reason, filename, filepath, dialog_link]
+        vk_link = f"https://vk.com/id{vk_id}"
+        row_data = [
+            time.strftime('%Y-%m-%d %H:%M:%S'),
+            vk_link,
+            fio_val,
+            reason,
+            filename,
+            filepath,
+            dialog_link,
+        ]
         log.info("Appending row: %s", row_data)
         ws.append_row(row_data, value_input_option='RAW')
         log.info("Successfully logged complaint to sheet for vk_id=%s reason=%s", vk_id, reason)
     except Exception as e:
         log.exception("Failed to log complaint to sheet for vk_id=%s reason=%s error=%s", vk_id, reason, str(e))
+
+
+def log_repet_complaint_to_sheet(vk_id: int, reason: str, filename: str = "", fio: str = ""):
+    """Записывает жалобу репетитора в Google таблицу."""
+    try:
+        log.info("Attempting to log repet complaint: vk_id=%s reason=%s filename=%s fio=%s", vk_id, reason, filename, fio)
+        client = get_gspread_client()
+        if not client:
+            log.error("Failed to get gspread client")
+            return
+        log.info("Got gspread client, opening repet sheet with ID=%s", REPET_GSHEET_ID)
+        sh = client.open_by_key(REPET_GSHEET_ID)
+        ws = sh.sheet1
+        dialog_link = f"https://vk.com/gim{GROUP_ID}?sel={vk_id}"
+        # Столбцы: Дата, vk куратора, ФИО куратора, Причина несогласия, Название ведомости, Ссылка на диалог
+        row_data = [time.strftime('%Y-%m-%d %H:%M:%S'), str(vk_id), fio, reason, filename, dialog_link]
+        log.info("Appending repet row: %s", row_data)
+        ws.append_row(row_data, value_input_option='RAW')
+        log.info("Successfully logged repet complaint to sheet for vk_id=%s reason=%s", vk_id, reason)
+    except Exception as e:
+        log.exception("Failed to log repet complaint to sheet for vk_id=%s reason=%s error=%s", vk_id, reason, str(e))
+
 
 def ensure_vedomosti_status_columns():
     try:
@@ -438,6 +482,39 @@ def _map_row_to_payment_data(row_dict, vk_id, original_filename):
     data['original_filename'] = os.path.basename(original_filename) if original_filename else ''
     return data
 
+
+def _map_row_to_repet_payment_data(row_dict, vk_id, original_filename):
+    """Маппинг данных для репетиторов из нового шаблона."""
+    def pick(*keys):
+        for k in keys:
+            if k is None:
+                continue
+            if k in row_dict and pd.notna(row_dict[k]):
+                return str(row_dict[k])
+        return ''
+    data = {}
+    data['fio'] = pick('Репетитор', 'ФИО', 'fio', 'name', 'full_name', 'FIO')
+    data['phone'] = pick('Номер', 'Телефон', 'phone', 'Phone', 'telephone')
+    data['console'] = pick('console', 'Console')
+    data['curator'] = pick('Репетитор', 'Куратор', 'curator', 'manager', 'curator_name')
+    data['vk_id'] = str(vk_id)
+    data['mail'] = pick('Почта', 'mail', 'email', 'Email')
+    data['groups'] = pick('Группы', 'groups', 'group', 'groups_list')
+    # Маппинг полей для репетиторов
+    data['subject'] = pick('Предмет')
+    data['lessons_held'] = pick('Кол-во состоявшихся занятий')
+    data['lessons_no_student'] = pick('Кол-во занятий, на которые не явился ученик')
+    data['base_payment'] = pick('Базовое вознаграждение за проведенные занятия')
+    data['okk'] = pick('OKK', 'ОКК')
+    data['rr'] = pick('RR')
+    data['kpi'] = pick('KPI')
+    data['preparation'] = pick('Подготовка к занятиям')
+    data['penalties'] = pick('Штраф')
+    data['total'] = pick('ИТОГ', 'Итого', 'Total', 'total')
+    data['original_filename'] = os.path.basename(original_filename) if original_filename else ''
+    return data
+
+
 def import_vedomosti_into_memory(send_immediately: bool = False, rate_limit_delay: float = 0.35):
     rows = fetch_unprocessed_vedomosti()
     if not rows:
@@ -473,11 +550,54 @@ def import_vedomosti_into_memory(send_immediately: bool = False, rate_limit_dela
                     log.warning("personal_path not found or empty for id=%s path=%s", db_id, personal_path)
             else:
                 log.warning("personal_path not found or empty for id=%s path=%s", db_id, personal_path)
-            payment_data = _map_row_to_payment_data(row_dict, vk_uid, original_filename)
+            
+            # Проверяем, является ли это выплатой репетитора (по наличию столбца "Репетитор" или "Номер" или по state)
+            is_repet = False
+            if state and state.startswith('repet_imported:'):
+                is_repet = True
+            elif isinstance(row_dict, dict):
+                is_repet = 'Репетитор' in row_dict or 'Номер' in row_dict
+            
+            if is_repet:
+                payment_data = _map_row_to_repet_payment_data(row_dict, vk_uid, original_filename)
+            else:
+                payment_data = _map_row_to_payment_data(row_dict, vk_uid, original_filename)
+
+            # Пропускаем записи с total == 0 (не записываем в память и не отправляем уведомления)
+            def _is_zero_total(val) -> bool:
+                if val is None:
+                    return True
+                s = str(val).strip()
+                if s == "":
+                    return True
+                # заменяем запятую для float
+                s_norm = s.replace(",", ".")
+                try:
+                    num = float(s_norm)
+                    return abs(num) < 1e-9
+                except Exception:
+                    return False
+
+            if _is_zero_total(payment_data.get('total')):
+                mark_vedomosti_state(db_id, 'skip_zero_total')
+                log.info("Skipped vedomosti id=%s for vk=%s (total=0)", db_id, vk_uid)
+                continue
+
+            # Сохраняем информацию о типе выплаты в данных
+            if is_repet:
+                payment_data['is_repet'] = True
+            else:
+                payment_data['is_repet'] = False
+
             pid = add_payment_for_user(vk_uid, payment_data)
-            mark_vedomosti_state(db_id, f"imported:{pid}")
+            
+            if is_repet:
+                mark_vedomosti_state(db_id, f"repet_imported:{pid}")
+            else:
+                mark_vedomosti_state(db_id, f"imported:{pid}")
+            
             processed += 1
-            log.info("Imported vedomosti id=%s -> payment %s for vk=%s (file=%s)", db_id, pid, vk_uid, original_filename)
+            log.info("Imported vedomosti id=%s -> payment %s for vk=%s (file=%s, is_repet=%s)", db_id, pid, vk_uid, original_filename, is_repet)
             if send_immediately:
                 try:
                     send_payment_message(vk_uid, find_payment(vk_uid, pid))
@@ -517,7 +637,7 @@ def load_imported_vedomosti_into_memory(send_notifications: bool = False, rate_l
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        c.execute("SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at FROM vedomosti_users WHERE state LIKE 'imported:%'")
+        c.execute("SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at FROM vedomosti_users WHERE state LIKE 'imported:%' OR state LIKE 'repet_imported:%'")
         rows = c.fetchall()
         conn.close()
     except Exception:
@@ -527,9 +647,12 @@ def load_imported_vedomosti_into_memory(send_notifications: bool = False, rate_l
     for db_row in rows:
         try:
             db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db = db_row
-            if not state or not state.startswith('imported:'):
+            if not state or (not state.startswith('imported:') and not state.startswith('repet_imported:')):
                 continue
-            parts = state.split(':', 1)
+            
+            is_repet = state.startswith('repet_imported:')
+            prefix = 'repet_imported:' if is_repet else 'imported:'
+            parts = state.split(prefix, 1)
             if len(parts) != 2 or not parts[1]:
                 continue
             payment_id = parts[1]
@@ -557,7 +680,13 @@ def load_imported_vedomosti_into_memory(send_notifications: bool = False, rate_l
                         row_dict = df.iloc[0].to_dict()
                 except Exception:
                     pass
-            payment_data = _map_row_to_payment_data(row_dict, vk_uid, original_filename)
+            
+            if is_repet:
+                payment_data = _map_row_to_repet_payment_data(row_dict, vk_uid, original_filename)
+                payment_data['is_repet'] = True
+            else:
+                payment_data = _map_row_to_payment_data(row_dict, vk_uid, original_filename)
+                payment_data['is_repet'] = False
             entry = {
                 "id": payment_id,
                 "data": payment_data,
@@ -568,7 +697,7 @@ def load_imported_vedomosti_into_memory(send_notifications: bool = False, rate_l
                 entry["disagree_reason"] = disagree_reason_db
             user_payments.setdefault(vk_uid, []).append(entry)
             loaded += 1
-            log.info("Loaded imported vedomosti db_id=%s -> payment %s for vk=%s (file=%s) status=%s", db_id, payment_id, vk_uid, original_filename, status_db)
+            log.info("Loaded imported vedomosti db_id=%s -> payment %s for vk=%s (file=%s) status=%s is_repet=%s", db_id, payment_id, vk_uid, original_filename, status_db, is_repet)
             if send_notifications:
                 try:
                     send_payment_message(vk_uid, find_payment(vk_uid, payment_id))
@@ -585,7 +714,7 @@ def cleanup_archived_payments():
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
-        c.execute("SELECT DISTINCT original_filename FROM vedomosti_users WHERE state LIKE 'imported:%'")
+        c.execute("SELECT DISTINCT original_filename FROM vedomosti_users WHERE state LIKE 'imported:%' OR state LIKE 'repet_imported:%'")
         active_files = {row[0] for row in c.fetchall()}
         conn.close()
         
@@ -744,7 +873,7 @@ def payments_list_keyboard(statements, page: int = 0, page_size: int = 6):
     return json.dumps(kb, ensure_ascii=False)
 
 
-def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 15):
+def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size: int = 5, add_more: bool = True):
     """Клавиатура списка выплат для конкретного пользователя с учетом его статусов."""
     total = len(user_payments_list)
     start = page * page_size
@@ -792,7 +921,7 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
                 "color": button_color
             }
         ])
-    if end < total:
+    if add_more and end < total:
         next_page = page + 1
         rows.append([
             {
@@ -807,6 +936,119 @@ def payments_list_keyboard_for_user(user_payments_list, page: int = 0, page_size
     kb = {"inline": True, "buttons": rows}
     return json.dumps(kb, ensure_ascii=False)
 
+def send_payments_list_multiple(user_id: int, payments: list, page: int = 0, use_vk_direct: bool = False):
+    """Отправляет список выплат, разбивая на несколько сообщений если кнопок больше 5.
+    
+    Args:
+        user_id: ID пользователя VK
+        payments: Список выплат
+        page: Номер страницы (0 для первой)
+        use_vk_direct: Если True, использует vk.messages.send напрямую, иначе safe_vk_send
+    """
+    if not payments:
+        if use_vk_direct:
+            vk.messages.send(user_id=user_id, random_id=vk_api.utils.get_random_id(), 
+                           message="У Вас нет выплат.", keyboard=chat_bottom_keyboard())
+        else:
+            safe_vk_send(user_id, "У Вас нет выплат.", chat_bottom_keyboard())
+        return
+    
+    total = len(payments)
+    page_size = 5  # Безопасный лимит для VK API
+    
+    # Если выплат <= 5, отправляем одним сообщением
+    if total <= page_size:
+        if page == 0:
+            message = "Список ведомостей (выберите):"
+        else:
+            message = f"Список ведомостей (страница {page+1}):"
+        keyboard = payments_list_keyboard_for_user(payments, page=page, page_size=page_size)
+        if use_vk_direct:
+            vk.messages.send(user_id=user_id, random_id=vk_api.utils.get_random_id(), 
+                           message=message, keyboard=keyboard)
+        else:
+            safe_vk_send(user_id, message, keyboard)
+        return
+    
+    # Если выплат больше 5 и это первая страница, отправляем несколько сообщений сразу
+    if page == 0:
+        # Отправляем первое сообщение с первыми 5 кнопками, без кнопки "Ещё"
+        keyboard = payments_list_keyboard_for_user(payments, page=0, page_size=page_size, add_more=False)
+        if use_vk_direct:
+            vk.messages.send(user_id=user_id, random_id=vk_api.utils.get_random_id(), 
+                           message="Список ведомостей (выберите):", keyboard=keyboard)
+        else:
+            safe_vk_send(user_id, "Список ведомостей (выберите):", keyboard)
+        
+        # Отправляем оставшиеся части
+        remaining_payments = payments[page_size:]
+        part_num = 2
+        
+        for i in range(0, len(remaining_payments), page_size):
+            part_payments = remaining_payments[i:i+page_size]
+            start_idx = page_size + i + 1  # Начальный индекс для нумерации
+            
+            # Создаем клавиатуру для этой части
+            rows = []
+            for idx, entry in enumerate(part_payments, start=start_idx):
+                sid = entry.get("id")
+                status = entry.get("status")
+                
+                if status == "agreed":
+                    max_label_length = 37
+                    base_label = _format_payment_label(
+                        entry.get("data", {}).get('original_filename'), 
+                        idx, 
+                        max_label_length,
+                        entry.get("created_at"),
+                        entry.get("db_id"),
+                        entry.get("data", {}).get("groups")
+                    )
+                    button_label = f"{base_label} "
+                    button_color = "positive"
+                else:
+                    base_label = _format_payment_label(
+                        entry.get("data", {}).get('original_filename'), 
+                        idx, 
+                        40,
+                        entry.get("created_at"),
+                        entry.get("db_id"),
+                        entry.get("data", {}).get("groups")
+                    )
+                    button_label = base_label
+                    button_color = "primary"
+                
+                rows.append([
+                    {
+                        "action": {
+                            "type": "text",
+                            "payload": json.dumps({"cmd": "open_statement", "statement_id": sid}, ensure_ascii=False),
+                            "label": button_label
+                        },
+                        "color": button_color
+                    }
+                ])
+            
+            kb = {"inline": True, "buttons": rows}
+            keyboard_json = json.dumps(kb, ensure_ascii=False)
+            
+            part_message = f"Список ведомостей (часть {part_num}):"
+            if use_vk_direct:
+                vk.messages.send(user_id=user_id, random_id=vk_api.utils.get_random_id(), 
+                               message=part_message, keyboard=keyboard_json)
+            else:
+                safe_vk_send(user_id, part_message, keyboard_json)
+            part_num += 1
+    else:
+        # Для страниц > 0 используем обычную пагинацию
+        message = f"Список ведомостей (страница {page+1}):"
+        keyboard = payments_list_keyboard_for_user(payments, page=page, page_size=page_size)
+        if use_vk_direct:
+            vk.messages.send(user_id=user_id, random_id=vk_api.utils.get_random_id(), 
+                           message=message, keyboard=keyboard)
+        else:
+            safe_vk_send(user_id, message, keyboard)
+
 
 def payments_disagree_keyboard(payment_id: str):
     labels = [
@@ -817,7 +1059,7 @@ def payments_disagree_keyboard(payment_id: str):
         "Вебинары",
         "Оплата за УП",
         "Оплата за чаты",
-        "Retention Rate",
+        "КПИ за продления",
         "Иная причина (связаться с оператором)"
     ]
     if len(labels) == 0:
@@ -951,7 +1193,7 @@ def format_payment_text(data: dict) -> str:
         groups_line = f"\nГруппы: {groups_str}" if groups_str else ""
         
         base = (f"=== Согласование выплаты ==="
-                f"\nВедомость: {original_filename.replace('.csv', '')}"
+                f"\nВедомость: {original_filename.replace('.csv', '').replace('_', ' ')}"
                 f"\nКуратор: {p.get('name', '')}"
                 f"\nТип куратора: {p.get('type', '')}"
                 f"\nПочта на платформе: {p.get('email', '')}"
@@ -974,7 +1216,7 @@ def format_payment_text(data: dict) -> str:
         
         # Используем красивое форматирование как в format_message
         base = (f"=== Согласование выплаты ==="
-                f"\nВедомость: {original_filename.replace('.csv', '')}"
+                f"\nВедомость: {original_filename.replace('.csv', '').replace('_', ' ')}"
                 f"\nКуратор: {p.get('name', '')}"
                 f"\nТип куратора: {p.get('type', '')}"
                 f"\nПочта на платформе: {p.get('email', '')}\n")
@@ -1084,6 +1326,97 @@ def format_payment_text_fallback(data: dict) -> str:
     lines.append("\nПросмотр ведомости возможен в течение 36 часов")
     return "\n".join(lines)
 
+
+def format_repet_payment_text(data: dict) -> str:
+    """Форматирует текст выплаты для репетиторов по новому шаблону."""
+    try:
+        vk_id_str = str(data.get('vk_id','')).strip()
+        original_filename = data.get('original_filename') or ''
+        
+        # Используем конкретный путь к файлу, если он есть в данных
+        personal_path = data.get('personal_path')
+        if personal_path and os.path.exists(personal_path):
+            csv_path = personal_path
+            log.debug("Using specific personal_path for format_repet_payment_text: %s", csv_path)
+        else:
+            # Fallback на старый метод поиска
+            if not vk_id_str or not original_filename:
+                return format_repet_payment_text_fallback(data)
+            
+            base_name = os.path.splitext(original_filename)[0] if original_filename else ''
+            csv_path = _find_curator_csv(base_name, int(vk_id_str))
+            if not csv_path:
+                return format_repet_payment_text_fallback(data)
+        
+        # Читаем CSV
+        try:
+            df = pd.read_csv(csv_path, dtype=str)
+        except Exception:
+            try:
+                df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+            except Exception:
+                return format_repet_payment_text_fallback(data)
+        
+        if df is None or df.empty:
+            return format_repet_payment_text_fallback(data)
+        
+        # Берём первую строку (персональный файл должен содержать одну строку)
+        p = df.fillna('0').iloc[0]
+        
+        # Форматируем сообщение по новому шаблону
+        msg = "Открыта ведомость\n\n"
+        msg += "=== Согласование выплаты ===\n"
+        msg += f"ФИО: {p.get('Репетитор', '') or data.get('fio', '')}\n"
+        msg += f"Предмет: {p.get('Предмет', '') or data.get('subject', '')}\n"
+        msg += f"Кол-во проведенных занятий: {p.get('Кол-во состоявшихся занятий', '') or data.get('lessons_held', '')}\n"
+        msg += f"Уроки без подключения ученика: {p.get('Кол-во занятий, на которые не явился ученик', '') or data.get('lessons_no_student', '')}\n"
+        msg += f"Оплата за занятия: {p.get('Базовое вознаграждение за проведенные занятия', '') or data.get('base_payment', '')}\n"
+        msg += f"Оценка контроля качества: {p.get('OKK', '') or p.get('ОКК', '') or data.get('okk', '')}\n"
+        msg += f"Критерий удержания учеников: {p.get('RR', '') or data.get('rr', '')}\n"
+        msg += f"Дополнительное вознаграждение за качество: {p.get('KPI', '') or data.get('kpi', '')}\n"
+        # Приоритет: data['preparation'] (из маппинга), затем из CSV напрямую
+        prep_val = data.get('preparation', '') or ''
+        if not str(prep_val).strip() or str(prep_val).strip() == '0':
+            prep_val = p.get('Подготовка к занятиям', '')
+        prep_str = str(prep_val).strip() if prep_val else '0'
+        msg += f"Доп. вознаграждение за подготовку: {prep_str}\n"
+        msg += f"Штрафы: {p.get('Штраф', '') or data.get('penalties', '')}\n"
+        msg += f"Итоговая сумма: {p.get('ИТОГ', '') or data.get('total', '')}\n\n"
+        msg += "Нажмите «Согласен», если у Вас нет разногласий с выставленными цифрами\n"
+        msg += "Нажмите «Не согласен», если Вы не согласны с каким-либо из пунктов\n"
+        msg += "Просмотр ведомости возможен в течение 36 часов"
+        
+        return msg
+        
+    except Exception:
+        log.exception("Failed to format repet payment text, using fallback")
+        return format_repet_payment_text_fallback(data)
+
+
+def format_repet_payment_text_fallback(data: dict) -> str:
+    """Простое форматирование выплаты для репетиторов (fallback)."""
+    lines = []
+    lines.append("Открыта ведомость")
+    lines.append("")
+    lines.append("=== Согласование выплаты ===")
+    lines.append(f"ФИО: {data.get('fio','')}")
+    lines.append(f"Предмет: {data.get('subject','')}")
+    lines.append(f"Кол-во проведенных занятий: {data.get('lessons_held','')}")
+    lines.append(f"Уроки без подключения ученика: {data.get('lessons_no_student','')}")
+    lines.append(f"Оплата за занятия: {data.get('base_payment','')}")
+    lines.append(f"Оценка контроля качества: {data.get('okk','')}")
+    lines.append(f"Критерий удержания учеников: {data.get('rr','')}")
+    lines.append(f"Дополнительное вознаграждение за качество: {data.get('kpi','')}")
+    lines.append(f"Доп. вознаграждение за подготовку: {data.get('preparation','')}")
+    lines.append(f"Штрафы: {data.get('penalties','')}")
+    lines.append(f"Итоговая сумма: {data.get('total','')}")
+    lines.append("")
+    lines.append("Нажмите «Согласен», если у Вас нет разногласий с выставленными цифрами")
+    lines.append("Нажмите «Не согласен», если Вы не согласны с каким-либо из пунктов")
+    lines.append("Просмотр ведомости возможен в течение 36 часов")
+    return "\n".join(lines)
+
+
 def map_reason_to_type(reason_label: str) -> str:
     mapping = {
         "Число учеников": "students",
@@ -1093,17 +1426,16 @@ def map_reason_to_type(reason_label: str) -> str:
         "Вебинары": "webs",
         "Оплата за УП": "up",
         "Оплата за чаты": "dops",
-        "Retention Rate": "rr",
+        "КПИ за продления": "rr",
     }
     return mapping.get(reason_label, "")
 
-def format_conflict(file_name, uid, conflict_type):
-    match conflict_type:
-        case "students":
+def format_conflict(file_name, uid, conflict_type, personal_path=None):
+    if conflict_type == "students":
             reply = (f"Количество учеников взято из журнала оплат с последних продлений (листы «Статистика по группам», «Статистика по кураторам»). "
                      f"Результат просуммирован за все группы"
                      f"\n\nЕсли ученик записался на сразу 2-й блок и не занимался в 1-м, оплата за его сопровождение в 1-м блоке не последует")
-        case "homework":
+    elif conflict_type == "homework":
             try:
                 def find_homework_csv(base_name: str, vk_uid: int):
                     root = os.path.dirname(os.path.abspath(__file__))
@@ -1140,45 +1472,625 @@ def format_conflict(file_name, uid, conflict_type):
                     df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
                 if df is None or df.empty or 'vk_id' not in df.columns:
                     raise ValueError("CSV missing data or vk_id column")
-                row = df[df['vk_id'].notna() & (df['vk_id'].astype(str) == str(uid))]
+
+                def _norm_vk(val):
+                    s = str(val).strip()
+                    m = re.search(r'(\d+)', s)
+                    return m.group(1) if m else s
+
+                df_valid = df[df['vk_id'].notna()].copy()
+                df_valid['_vk_norm'] = df_valid['vk_id'].apply(_norm_vk)
+                row = df_valid[df_valid['_vk_norm'].astype(str) == str(uid)]
                 if row.empty:
                     raise ValueError("User row not found in CSV")
                 p = row.fillna('0').iloc[0]
+
                 def to_int_safe(v):
                     try:
                         return int(float(str(v)))
                     except Exception:
                         return 0
-                abs_val = to_int_safe(p.get('checks_all'))
-                prev_val = to_int_safe(p.get('checks_prev'))
-                fin_val = to_int_safe(p.get('checks_salary'))
+
+                abs_val = to_int_safe(p['checks_all'])
+                prev_val = to_int_safe(p['checks_prev'])
+                fin_val = to_int_safe(p['checks_salary'])
                 reply = (f"Оплата за ДЗ считается как общая сумма за проверенные номера за всё время минус ранее оплаченные работы. Годовые и полугодовые курсы разделяются в вопросе расчета выплаты"
                          f"\n\nОбщая сумма твоих проверок за всё время на аккаунте: {abs_val}"
                          f"\nОбщая сумма твоих проверок на момент предыдущей выплаты: {prev_val}"
                          f"\nТаким образом, в эту выплату пойдёт: {abs_val} - {prev_val} = {fin_val}"
                          f"\n\nЕсли в какой-либо выгрузке ты видишь, что итоговая сумма уже больше, чем сейчас, то эта разница пойдет в следующую выплату")
-            except Exception:
+
+            except Exception as e:
+                log.exception("Error processing homework CSV: %s", e)
                 reply = (f"Оплата за ДЗ считается как общая сумма за проверенные номера за всё время минус ранее оплаченные работы. Годовые и полугодовые курсы разделяются в вопросе расчета выплаты"
                          f"\n\nЕсли конкретные цифры недоступны, сверка по CSV будет выполнена оператором.")
-        case "fines":
+    elif conflict_type == "fines":
             reply = (f"Штрафы выставляются старшими кураторами курса. Если ты не осведомлен(-а) о каком-либо вычете, уточни об этом у старшего куратора"
                      f"\nМы можем откорректировать сумму штрафа в выплате, если запрос на это передаст старший куратор")
-        case "meth":
+    elif conflict_type == "meth":
             reply = (f"Оплата за стол заказов выставляется методистом предмета, по вопросам расчёта выплаты обращайся к нему"
                     f"\nМы можем откорректировать сумму за стол заказов в выплате, если запрос на это передаст методист")
-        case "webs":
+    elif conflict_type == "webs":
             reply = (f"Сумму за вебы можно отследить в течение блока, тк вы самостоятельно заполняете отчетность по ним."
                      f"\nЕсли ты не заполнил(-а) все вебы за этот блок, то можешь их добавить в следующий. Данные за этот блок уже считаны, их не исправить")
-        case "up":
+    elif conflict_type == "up":
             reply = (f"Оплату УП выставляет руководитель УП, уточни, пожалуйста, у него этот момент"
                      f"\nМы можем откорректировать сумму за УП в выплате, если запрос на это передаст руководитель УП")
-        case "dops":
+    elif conflict_type == "dops":
             reply = (f"Дополнительные выплаты (проверки, перепроверки) рассчитывает и выставляет старший куратор, уточни, пожалуйста, у него этот момент"
                      f"\nМы можем откорректировать сумму допов в выплате, если запрос на это передаст старший куратор")
-        case "rr":
+    elif conflict_type == "rr":
+        try:
+            def find_rr_csv(base_name: str, vk_uid: int):
+                root = os.path.dirname(os.path.abspath(__file__))
+                patterns = [
+                    os.path.join(root, "hosting", "open", "**", "users", f"{vk_uid}_*_{base_name}.csv"),
+                    os.path.join(root, "hosting", "open", "**", "users", f"{vk_uid}_*_{base_name.replace(' ','_')}.csv"),
+                ]
+                matches = []
+                for pat in patterns:
+                    matches.extend(glob.glob(pat, recursive=True))
+                if matches:
+                    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    return matches[0]
+                group_patterns = [
+                    os.path.join(root, "hosting", "open", "**", f"{base_name}.csv"),
+                    os.path.join(root, "hosting", "open", "**", f"{base_name.replace(' ','_')}.csv"),
+                ]
+                group_matches = []
+                for pat in group_patterns:
+                    group_matches.extend(glob.glob(pat, recursive=True))
+                if group_matches:
+                    group_matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    return group_matches[0]
+                return None
+
+            def find_excel_file(csv_path: str):
+                """Находит исходный Excel файл по пути к CSV."""
+                if not csv_path:
+                    return None
+                
+                csv_dir = os.path.dirname(csv_path)
+                csv_basename = os.path.basename(csv_path)
+                csv_name_noext = os.path.splitext(csv_basename)[0]
+                
+                # Если CSV файл находится в папке users, ищем групповой CSV файл
+                group_csv_path = None
+                search_dir = csv_dir
+                
+                if 'users' in csv_dir:
+                    parent_dir = os.path.dirname(csv_dir)
+                    # Ищем групповой CSV файл в родительской директории
+                    if os.path.exists(parent_dir):
+                        for filename in os.listdir(parent_dir):
+                            if filename.lower().endswith('.csv') and 'users' not in filename:
+                                group_csv_path = os.path.join(parent_dir, filename)
+                                search_dir = parent_dir  # Ищем Excel в той же директории, где групповой CSV
+                                log.info("Found group CSV: %s, will search Excel in: %s", group_csv_path, search_dir)
+                                break
+                else:
+                    group_csv_path = csv_path
+                
+                # Определяем базовое имя для поиска Excel (из группового CSV)
+                if group_csv_path and os.path.exists(group_csv_path):
+                    group_base = os.path.splitext(os.path.basename(group_csv_path))[0]
+                else:
+                    group_base = csv_name_noext
+                
+                # ПРИОРИТЕТ 1: Ищем Excel файл в той же директории, что и групповой CSV (hosting/open/...)
+                if os.path.exists(search_dir):
+                    for ext in ['.xlsx', '.xls']:
+                        # Пробуем точное имя
+                        excel_path = os.path.join(search_dir, group_base + ext)
+                        if os.path.exists(excel_path):
+                            log.info("Found Excel file in same directory as CSV: %s", excel_path)
+                            return excel_path
+                        
+                        # Пробуем все Excel файлы в этой директории
+                        for filename in os.listdir(search_dir):
+                            if filename.lower().endswith(ext):
+                                # Проверяем, совпадает ли базовое имя (с учетом замены пробелов/подчеркиваний)
+                                file_base = os.path.splitext(filename)[0]
+                                if (group_base in file_base or file_base in group_base or 
+                                    group_base.replace('_', ' ') in file_base or 
+                                    group_base.replace(' ', '_') in file_base):
+                                    excel_path = os.path.join(search_dir, filename)
+                                    log.info("Found Excel file in same directory: %s", excel_path)
+                                    return excel_path
+                
+                # ПРИОРИТЕТ 2: Ищем Excel файл во всех поддиректориях hosting/open
+                root = os.path.dirname(os.path.abspath(__file__))
+                hosting_open = os.path.join(root, "hosting", "open")
+                if os.path.exists(hosting_open):
+                    for ext in ['.xlsx', '.xls']:
+                        patterns = [
+                            os.path.join(hosting_open, "**", f"{group_base}{ext}"),
+                            os.path.join(hosting_open, "**", f"{group_base.replace('_', ' ')}{ext}"),
+                            os.path.join(hosting_open, "**", f"{group_base.replace(' ', '_')}{ext}"),
+                        ]
+                        for pattern in patterns:
+                            matches = glob.glob(pattern, recursive=True)
+                            if matches:
+                                matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                                log.info("Found Excel file in hosting/open: %s", matches[0])
+                                return matches[0]
+                
+                # ПРИОРИТЕТ 3: Ищем по оригинальному имени файла в uploads (последний вариант)
+                uploads_dir = os.path.join(root, "uploads")
+                if os.path.exists(uploads_dir):
+                    for filename in os.listdir(uploads_dir):
+                        if filename.lower().endswith(('.xlsx', '.xls')):
+                            filename_base = os.path.splitext(filename)[0]
+                            if (group_base in filename_base or filename_base in group_base or
+                                group_base.replace('_', ' ') in filename_base or 
+                                group_base.replace(' ', '_') in filename_base):
+                                excel_path = os.path.join(uploads_dir, filename)
+                                log.info("Found Excel file in uploads: %s", excel_path)
+                                return excel_path
+                
+                return None
+
+            def read_excel_cell(excel_path: str, row: int, col_letter: str):
+                """Читает значение из ячейки Excel по буквенному обозначению столбца."""
+                if not excel_path or not os.path.exists(excel_path):
+                    log.warning("Excel file not found: %s", excel_path)
+                    return None
+                
+                try:
+                    # Пробуем использовать openpyxl
+                    try:
+                        import openpyxl
+                        # Сначала пробуем с data_only=True (для вычисленных значений)
+                        wb = openpyxl.load_workbook(excel_path, data_only=True)
+                        ws = wb.active
+                        cell_address = f"{col_letter}{row}"
+                        log.info("Attempting to read Excel cell %s from %s (active sheet: %s)", cell_address, excel_path, ws.title)
+                        cell_value = ws[cell_address].value
+                        log.info("Read Excel cell %s from %s (data_only=True): %s (type: %s)", cell_address, excel_path, cell_value, type(cell_value).__name__)
+                        
+                        # Если значение None, пробуем без data_only (для формул)
+                        if cell_value is None:
+                            log.info("Value is None with data_only=True, trying data_only=False")
+                            wb.close()
+                            wb = openpyxl.load_workbook(excel_path, data_only=False)
+                            ws = wb.active
+                            cell_value = ws[cell_address].value
+                            log.info("Read Excel cell %s from %s (data_only=False): %s (type: %s)", cell_address, excel_path, cell_value, type(cell_value).__name__)
+                            
+                            # Если это формула, пробуем получить ее текст
+                            if hasattr(ws[cell_address], 'data_type') and ws[cell_address].data_type == 'f':
+                                formula = ws[cell_address].value
+                                log.info("Cell %s contains formula: %s", cell_address, formula)
+                        
+                        # Если все еще None, пробуем другие листы
+                        if cell_value is None and len(wb.sheetnames) > 1:
+                            log.info("Value still None, checking other sheets: %s", wb.sheetnames)
+                            for sheet_name in wb.sheetnames:
+                                if sheet_name != ws.title:
+                                    ws_test = wb[sheet_name]
+                                    cell_value = ws_test[cell_address].value
+                                    log.info("Checked sheet '%s', cell %s: %s", sheet_name, cell_address, cell_value)
+                                    if cell_value is not None:
+                                        log.info("Found value in sheet '%s': %s", sheet_name, cell_value)
+                                        break
+                        
+                        # Проверяем соседние ячейки для отладки
+                        if cell_value is None:
+                            log.warning("Cell %s is None. Checking nearby cells for debugging:", cell_address)
+                            for offset_row in [-1, 0, 1]:
+                                for offset_col in [-1, 0, 1]:
+                                    if offset_row == 0 and offset_col == 0:
+                                        continue
+                                    try:
+                                        # Конвертируем смещение столбца
+                                        col_num = ord(col_letter[-1]) - ord('A') + 1
+                                        new_col_letter = chr(ord('A') + col_num + offset_col - 1)
+                                        if col_num + offset_col > 0:
+                                            test_address = f"{new_col_letter}{row + offset_row}"
+                                            test_value = ws[test_address].value
+                                            if test_value is not None:
+                                                log.info("  Nearby cell %s: %s", test_address, test_value)
+                                    except Exception:
+                                        pass
+                        
+                        wb.close()
+                        return cell_value
+                    except ImportError:
+                        log.warning("openpyxl not installed, using pandas fallback")
+                        # Fallback на pandas
+                        df = pd.read_excel(excel_path, header=None, engine='openpyxl' if 'openpyxl' in str(pd.read_excel.__defaults__) else None)
+                        # Конвертируем букву столбца в индекс
+                        # AS = A(1)*26 + S(19) = 26 + 19 = 45, но индексация с 0, так что 44
+                        col_idx = 0
+                        for char in col_letter:
+                            col_idx = col_idx * 26 + (ord(char.upper()) - ord('A') + 1)
+                        col_idx -= 1  # Индексация с 0
+                        log.debug("Converted column %s to index %d (row %d, df shape: %s)", col_letter, col_idx, row, df.shape)
+                        if row - 1 < len(df) and col_idx < len(df.columns):
+                            cell_value = df.iloc[row - 1, col_idx]
+                            log.debug("Read Excel cell %s%d from %s via pandas: %s", col_letter, row, excel_path, cell_value)
+                            return cell_value
+                        else:
+                            log.warning("Cell %s%d is out of bounds (df shape: %s, col_idx: %d)", col_letter, row, df.shape, col_idx)
+                        return None
+                    except Exception as e:
+                        log.exception("Error reading Excel cell %s%d from %s with openpyxl: %s", col_letter, row, excel_path, e)
+                        # Пробуем pandas как fallback
+                        try:
+                            df = pd.read_excel(excel_path, header=None)
+                            col_idx = 0
+                            for char in col_letter:
+                                col_idx = col_idx * 26 + (ord(char.upper()) - ord('A') + 1)
+                            col_idx -= 1
+                            if row - 1 < len(df) and col_idx < len(df.columns):
+                                return df.iloc[row - 1, col_idx]
+                        except Exception as e2:
+                            log.exception("Error reading Excel cell %s%d from %s with pandas: %s", col_letter, row, excel_path, e2)
+                        return None
+                except Exception as e:
+                    log.exception("Error reading Excel cell %s%d from %s: %s", col_letter, row, excel_path, e)
+                    return None
+
+            def parse_percent(value):
+                """Парсит процентное значение из строки.
+                Если значение < 1, считаем это десятичной дробью (0.8913 -> 89.13%).
+                Если значение >= 1, считаем это процентами (96.67 -> 96.67% или 96.67% -> 96.67).
+                """
+                if value is None:
+                    return None
+                s = str(value).strip().replace('%', '').replace(',', '.')
+                try:
+                    val = float(s)
+                    # Если значение меньше 1, это десятичная дробь (0.8913 = 89.13%)
+                    if val < 1.0:
+                        val = val * 100
+                    return val
+                except Exception:
+                    return None
+            
+            def format_percent_display(value):
+                """Форматирует процент для отображения (округление до 2 знаков)."""
+                if value is None:
+                    return "0%"
+                try:
+                    rounded = round(float(value), 2)
+                    if rounded.is_integer():
+                        return f"{int(rounded)}%"
+                    return f"{rounded}%"
+                except Exception:
+                    return f"{value}%"
+
+            # Используем personal_path если передан (тот же файл, что и для ведомости)
+            # Иначе ищем через find_rr_csv
+            csv_path = None
+            if personal_path and os.path.exists(personal_path):
+                csv_path = personal_path
+                log.info("Using personal_path for RR calculation: %s", csv_path)
+            elif file_name:
+                csv_path = find_rr_csv(file_name, uid)
+                if csv_path:
+                    log.info("Found CSV via find_rr_csv: %s", csv_path)
+            
+            if not csv_path:
+                log.error("CSV for RR not found: personal_path=%s, file_name=%s, uid=%s", personal_path, file_name, uid)
+                raise FileNotFoundError("CSV for RR not found")
+            
+            try:
+                df = pd.read_csv(csv_path, dtype=str)
+            except Exception:
+                df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+            if df is None or df.empty or 'vk_id' not in df.columns:
+                raise ValueError("CSV missing data or vk_id column")
+
+            def _norm_vk(val):
+                s = str(val).strip()
+                m = re.search(r'(\d+)', s)
+                return m.group(1) if m else s
+
+            df_valid = df[df['vk_id'].notna()].copy()
+            df_valid['_vk_norm'] = df_valid['vk_id'].apply(_norm_vk)
+            log.info("Looking for user %s in CSV %s. Found %d rows with valid vk_id", uid, csv_path, len(df_valid))
+            log.info("Sample normalized vk_ids: %s", df_valid['_vk_norm'].head(10).tolist() if len(df_valid) > 0 else [])
+            
+            row = df_valid[df_valid['_vk_norm'].astype(str) == str(uid)]
+            if row.empty:
+                log.error("User %s not found in CSV %s. Available vk_ids (normalized): %s", uid, csv_path, df_valid['_vk_norm'].unique().tolist())
+                raise ValueError("User row not found in CSV")
+            
+            log.info("Found user row in CSV. Row index: %s", row.index.tolist())
+            p = row.fillna('0').iloc[0]
+            
+            # Логируем все значения из найденной строки
+            log.info("Reading data from CSV row for user %s:", uid)
+            log.info("  CSV file: %s", csv_path)
+            log.info("  name: %s", p.get('name', ''))
+            log.info("  vk_id: %s", p.get('vk_id', ''))
+            log.info("  class: %s", p.get('class', ''))
+            log.info("  type: %s", p.get('type', ''))
+            log.info("  rr_gk: %s", p.get('rr_gk', ''))
+            log.info("  rr_gkp: %s", p.get('rr_gkp', ''))
+            log.info("  stud_gk: %s", p.get('stud_gk', ''))
+            log.info("  stud_gkp: %s", p.get('stud_gkp', ''))
+            log.info("  base: %s", p.get('base', ''))
+            log.info("  rr_salary_gk: %s", p.get('rr_salary_gk', ''))
+            log.info("  rr_salary_gkp: %s", p.get('rr_salary_gkp', ''))
+
+            def to_float_safe(v):
+                try:
+                    s = str(v).replace(',', '.').replace('%', '').strip()
+                    return float(s)
+                except Exception:
+                    return None
+
+            def to_int_safe(v):
+                try:
+                    return int(float(str(v)))
+                except Exception:
+                    return 0
+
+            # Читаем данные пользователя
+            course_type = str(p.get('class', '')).strip()
+            curator_type = str(p.get('type', '')).strip()
+            rr_gk_str = p.get('rr_gk', '')
+            rr_gkp_str = p.get('rr_gkp', '')
+            stud_gk = to_int_safe(p.get('stud_gk', 0))
+            stud_gkp = to_int_safe(p.get('stud_gkp', 0))
+            base = to_int_safe(p.get('base', 0))
+            rr_salary_gk = to_float_safe(p.get('rr_salary_gk', 0))
+            rr_salary_gkp = to_float_safe(p.get('rr_salary_gkp', 0))
+            
+            log.info("RR calculation input: course_type=%s, curator_type=%s, rr_gk_str=%s, rr_gkp_str=%s, stud_gk=%s, stud_gkp=%s, base=%s, rr_salary_gk=%s, rr_salary_gkp=%s", 
+                    course_type, curator_type, rr_gk_str, rr_gkp_str, stud_gk, stud_gkp, base, rr_salary_gk, rr_salary_gkp)
+
+            # Находим Excel файл
+            # Сначала находим директорию, где находится групповой CSV (hosting/open/тест/тест/7/)
+            group_csv_dir = None
+            if 'users' in csv_path:
+                group_csv_dir = os.path.dirname(csv_path)  # hosting/open/тест/тест/7/users
+                group_csv_dir = os.path.dirname(group_csv_dir)  # hosting/open/тест/тест/7
+            else:
+                group_csv_dir = os.path.dirname(csv_path)
+            
+            log.info("Looking for Excel file in directory: %s (CSV path: %s, file_name: %s)", group_csv_dir, csv_path, file_name)
+            
+            # Ищем Excel файл
+            # ПРИОРИТЕТ 1: Ищем в директории группового CSV (hosting/open/тест/тест/7/)
+            excel_path = None
+            if group_csv_dir and os.path.exists(group_csv_dir):
+                # Сначала пробуем найти по имени file_name (base_name) - это будет тест_тест_7.xlsx
+                if file_name:
+                    for ext in ['.xlsx', '.xls']:
+                        test_path = os.path.join(group_csv_dir, file_name + ext)
+                        if os.path.exists(test_path):
+                            excel_path = test_path
+                            log.info("Found Excel file by file_name in group CSV directory: %s", excel_path)
+                            break
+                
+                # Если не нашли по file_name, ищем любой Excel файл в этой директории
+                if not excel_path:
+                    excel_files = []
+                    if os.path.exists(group_csv_dir):
+                        for filename in os.listdir(group_csv_dir):
+                            if filename.lower().endswith(('.xlsx', '.xls')) and 'users' not in filename:
+                                excel_files.append(os.path.join(group_csv_dir, filename))
+                    
+                    if excel_files:
+                        # Берем самый свежий файл
+                        excel_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                        excel_path = excel_files[0]
+                        log.info("Found Excel file (any) in group CSV directory: %s", excel_path)
+            
+            # ПРИОРИТЕТ 2: Если не нашли, ищем в uploads по исходному имени (может быть тест.xlsx)
+            if not excel_path:
+                root = os.path.dirname(os.path.abspath(__file__))
+                uploads_dir = os.path.join(root, "uploads")
+                if os.path.exists(uploads_dir):
+                    # Ищем любой Excel файл в uploads (возможно, исходный файл)
+                    uploads_excel = []
+                    for filename in os.listdir(uploads_dir):
+                        if filename.lower().endswith(('.xlsx', '.xls')):
+                            uploads_excel.append(os.path.join(uploads_dir, filename))
+                    
+                    if uploads_excel:
+                        # Берем самый свежий файл из uploads
+                        uploads_excel.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                        excel_path = uploads_excel[0]
+                        log.info("Found Excel file in uploads: %s", excel_path)
+            
+            # ПРИОРИТЕТ 3: Используем функцию поиска
+            if not excel_path:
+                log.info("Excel file not found in %s or uploads, using find_excel_file function", group_csv_dir)
+                excel_path = find_excel_file(csv_path)
+            
+            if not excel_path:
+                log.warning("Excel file not found for CSV: %s. Searched in: %s, file_name: %s", csv_path, group_csv_dir, file_name)
+                raise FileNotFoundError("Excel file not found")
+            
+            log.info("Using Excel file for RR calculation: %s (CSV: %s)", excel_path, csv_path)
+
+            reply_parts = []
+            reply_parts.append("Твой RR считается по формуле из договора, а именно:")
+
+            # Определяем, для каких курсов нужно показать расчет
+            show_gk = course_type == 'ГК' and stud_gk > 0
+            show_gkp = course_type == 'ГК+' and stud_gkp > 0
+            
+            # Для ГК/ГК+ показываем оба
+            if course_type == 'ГК/ГК+':
+                show_gk = stud_gk > 0
+                show_gkp = stud_gkp > 0
+            
+            log.info("RR calculation: course_type=%s, curator_type=%s, stud_gk=%d, stud_gkp=%d, show_gk=%s, show_gkp=%s", 
+                    course_type, curator_type, stud_gk, stud_gkp, show_gk, show_gkp)
+
+            # Определяем строки для чтения min/max (только строки 3 и 11)
+            row_min_max = 3 if curator_type == 'Личный' else 11  # Для AS3/AT3 или AS11/AT11
+            log.info("Reading min/max from Excel row %d for curator_type=%s", row_min_max, curator_type)
+
+            # Флаг для отслеживания, была ли добавлена формула расчета
+            has_formula = False
+
+            for course_name, is_gk in [('ГК', True), ('ГК+', False)]:
+                # Пропускаем, если для этого курса не нужно показывать расчет
+                if (is_gk and not show_gk) or (not is_gk and not show_gkp):
+                    log.debug("Skipping %s: is_gk=%s, show_gk=%s, show_gkp=%s", course_name, is_gk, show_gk, show_gkp)
+                    continue
+                
+                log.info("Processing RR calculation for %s", course_name)
+
+                # Определяем столбцы для min/max
+                if is_gk:
+                    min_col = 'AS'
+                    max_col = 'AT'
+                    min_contract_col = 'AS'  # Для проверки минимального значения по договору
+                    rr_value_str = rr_gk_str
+                    stud_count = stud_gk
+                    rr_salary = rr_salary_gk
+                else:
+                    min_col = 'AW'
+                    max_col = 'AX'
+                    min_contract_col = 'AW'  # Для проверки минимального значения по договору
+                    rr_value_str = rr_gkp_str
+                    stud_count = stud_gkp
+                    rr_salary = rr_salary_gkp
+
+                log.info("Processing %s: rr_value_str=%s, stud_count=%d, base=%s", course_name, rr_value_str, stud_count, base)
+                
+                if not rr_value_str or stud_count == 0:
+                    log.warning("Skipping %s: rr_value_str=%s, stud_count=%d", course_name, rr_value_str, stud_count)
+                    continue
+                
+                if base == 0:
+                    log.warning("Skipping %s: base is 0", course_name)
+                    continue
+
+                # Читаем min/max из Excel (строки 3 или 11)
+                log.info("Reading min/max for %s: %s%d and %s%d", course_name, min_col, row_min_max, max_col, row_min_max)
+                min_val = read_excel_cell(excel_path, row_min_max, min_col)
+                max_val = read_excel_cell(excel_path, row_min_max, max_col)
+                log.info("Read values for %s: min=%s (from %s%d), max=%s (from %s%d)", 
+                        course_name, min_val, min_col, row_min_max, max_val, max_col, row_min_max)
+
+                if min_val is None or max_val is None:
+                    log.warning("Could not read min/max from Excel for %s: min=%s (from %s%d), max=%s (from %s%d). Excel file: %s", 
+                              course_name, min_val, min_col, row_min_max, max_val, max_col, row_min_max, excel_path)
+                    continue
+
+                try:
+                    min_raw = float(str(min_val).replace(',', '.').replace('%', ''))
+                    max_raw = float(str(max_val).replace(',', '.').replace('%', ''))
+                    # Если значения меньше 1, считаем это десятичной дробью и преобразуем в проценты
+                    min_float = min_raw * 100 if min_raw < 1.0 else min_raw
+                    max_float = max_raw * 100 if max_raw < 1.0 else max_raw
+                    log.info("Parsed min/max for %s: min_raw=%s -> min_float=%s, max_raw=%s -> max_float=%s", 
+                            course_name, min_raw, min_float, max_raw, max_float)
+                except Exception as e:
+                    log.warning("Could not parse min/max values: min=%s, max=%s, error=%s", min_val, max_val, e)
+                    continue
+
+                # Парсим RR значение (процент)
+                log.info("Parsing RR value for %s: rr_value_str=%s", course_name, rr_value_str)
+                rr_percent = parse_percent(rr_value_str)
+                if rr_percent is None:
+                    log.warning("Could not parse RR value: %s", rr_value_str)
+                    continue
+                log.info("Parsed RR percent for %s: %s", course_name, rr_percent)
+                
+                # Проверяем, если RR <= минимального значения по договору
+                if rr_percent <= min_float:
+                    log.info("RR %s <= min %s for %s, showing special message", rr_percent, min_float, course_name)
+                    rr_display = format_percent_display(rr_percent)
+                    min_display = format_percent_display(min_float)
+                    reply_parts.append(f"\n\nДля {course_name}: Твой RR, взятый из ЖО: {rr_display} меньше или равен минимальному значению по договору: {min_display}, поэтому оплата за RR составляет: {rr_salary:.2f}₽")
+                    continue
+
+                # Если значение ФП больше максимума, то берется максимум
+                fp_value = rr_percent
+                fp_exceeds_max = False
+                if rr_percent > max_float:
+                    log.info("RR %s > max %s for %s, using max value", rr_percent, max_float, course_name)
+                    fp_value = max_float
+                    fp_exceeds_max = True
+
+                # Определяем, какой тип куратора (сотник или личный)
+                is_sotnik = curator_type != 'Личный'
+                
+                # Рассчитываем по формуле в зависимости от типа куратора
+                if is_sotnik:
+                    # Для сотников: (ФП-МИН)/(МАКС-МИН)*0.7*КОЛ-ВО_ДЕТЕЙ*30
+                    log.info("Calculating RR for %s (сотник): fp_value=%s (rr_percent=%s), min_float=%s, max_float=%s, stud_count=%s", 
+                            course_name, fp_value, rr_percent, min_float, max_float, stud_count)
+                    
+                    if max_float - min_float == 0:
+                        calculated = 0
+                        log.warning("max_float - min_float == 0 for %s, setting calculated=0", course_name)
+                    else:
+                        calculated = ((fp_value - min_float) / (max_float - min_float)) * 0.7 * stud_count * 30
+                        log.info("Calculated RR for %s (сотник): %s", course_name, calculated)
+
+                    # Округляем значения для отображения в формуле
+                    fp_display_val = round(fp_value, 2)
+                    min_display_val = round(min_float, 2)
+                    max_display_val = round(max_float, 2)
+                    
+                    formula_text = f"\n\nДля {course_name}: Оплата за RR = (ФП-МИН) / (МАКС-МИН)* 0.7 * КОЛ-ВО_ДЕТЕЙ * 30 =({fp_display_val} - {min_display_val})/({max_display_val} - {min_display_val})*0.7*{stud_count}*30 = {calculated:.2f}₽"
+                    
+                    # Добавляем примечание, если ФП превысил максимум
+                    if fp_exceeds_max:
+                        formula_text += "\n*в данном случае ФП=МАКС, так как твой показатель ФП превысил максимальный процент (подробнее см. в договоре)"
+                else:
+                    # Для личных: (ФП-МИН)/(МАКС-МИН)*0.3*0.7*КОЛ-ВО_ДЕТЕЙ*СТАВКА_ЗА_УЧЕНИКА
+                    log.info("Calculating RR for %s (личный): fp_value=%s (rr_percent=%s), min_float=%s, max_float=%s, stud_count=%s, base=%s", 
+                            course_name, fp_value, rr_percent, min_float, max_float, stud_count, base)
+                    
+                    if max_float - min_float == 0:
+                        calculated = 0
+                        log.warning("max_float - min_float == 0 for %s, setting calculated=0", course_name)
+                    else:
+                        calculated = ((fp_value - min_float) / (max_float - min_float)) * 0.3 * 0.7 * stud_count * base
+                        log.info("Calculated RR for %s (личный): %s", course_name, calculated)
+
+                    # Округляем значения для отображения в формуле
+                    fp_display_val = round(fp_value, 2)
+                    min_display_val = round(min_float, 2)
+                    max_display_val = round(max_float, 2)
+                    
+                    formula_text = f"\n\nДля {course_name}: Оплата за RR = (ФП-МИН) / (МАКС-МИН)*0.3 * 0.7 * КОЛ-ВО_ДЕТЕЙ * СТАВКА_ЗА_УЧЕНИКА =({fp_display_val} - {min_display_val})/({max_display_val} - {min_display_val})*0.3*0.7*{stud_count}*{base} = {calculated:.2f}₽"
+                    
+                    # Добавляем примечание, если ФП превысил максимум
+                    if fp_exceeds_max:
+                        formula_text += "\n*в данном случае ФП=МАКС, так как твой показатель ФП превысил максимальный процент (подробнее см. в договоре)"
+                
+                reply_parts.append(formula_text)
+                has_formula = True
+
+            log.info("Finished RR calculation loop. reply_parts length: %d, has_formula=%s", len(reply_parts), has_formula)
+            if len(reply_parts) == 1:
+                # Не удалось рассчитать ни для одного курса (только начальное сообщение)
+                log.error("Could not calculate RR for any course. reply_parts: %s", reply_parts)
+                raise ValueError("Could not calculate RR for any course")
+
+            # Добавляем пояснение только если была добавлена формула расчета
+            if has_formula:
+                is_sotnik = curator_type != 'Личный'
+                reply_parts.append("\n\nФП - фактическое значение RR, взятое из ЖО за ПРОШЛЫЙ блок.")
+                reply_parts.append("\nМАКС, МИН - Макс. и мин. проценты из договора.")
+                if not is_sotnik:
+                    reply_parts.append("\n0.3 - Добавочный коэффициент.")
+                reply_parts.append("\n0.7 - Вес метрики.")
+                reply_parts.append("\nКОЛ-ВО_ДЕТЕЙ - Количество детей в твоей группе.")
+                if is_sotnik:
+                    reply_parts.append("\n30 - Фиксированная оплата за одного обучающегося.")
+                else:
+                    reply_parts.append("\nСТАВКА_ЗА_УЧЕНИКА - фиксированная оплата за одного обучающегося.")
+
+            reply = "".join(reply_parts)
+
+        except Exception as e:
+            log.exception("Error processing RR calculation: %s", e)
             reply = (f"Данные по retention rate взяты из журнала оплат за предыдущий блок (например, если мы считаем выплату за 2-й блок, то берём RR с 1 на 2 блок."
                      f"\nВсе причины слива одинаково учитываются в Retention Rate. Если произошло обстоятельство непреодолимой силы (например, ученик погиб), ты можешь обратиться к СК для корректировки RR, но только в таких случаях")
-        case _:
+    else:
             reply = ""
 
     return reply
@@ -1351,7 +2263,7 @@ def _compose_payment_sections(p: dict) -> dict:
                 return f"{int(num)}%"
             return f"{num}%"
         except Exception:
-            return s
+                return s
 
     # Сопровождение ГК / ГК+
     stud_gk = _to_int_safe(p.get('stud_gk'))
@@ -1401,12 +2313,10 @@ def _compose_payment_sections(p: dict) -> dict:
         gk_lines.append(f"\n→ Сумма оклада: {stud_salary_gk_val}₽")
     elif stud_salary_total > 0:
         gk_lines.append(f"\n→ Сумма оклада: {stud_salary_total}₽")
-    if stud_rep > 0:
-        gk_lines.append(f"\nКол-во учеников с тарифом с репетитором: {stud_rep}")
+        if stud_rep > 0:
+            gk_lines.append(f"\nКол-во учеников с тарифом с репетитором: {stud_rep}")
     if rep_salary != '0' and _to_float_safe(rep_salary) > 0:
         gk_lines.append(f"\nДоплата за учеников с репетитором: {rep_salary}₽")
-    if slivs_gk > 0:
-        gk_lines.append(f"\nКол-во сливов/киков (ГК): {slivs_gk}")
     if rr_gk:
         gk_lines.append(f"\nRetention ГК: {rr_gk}")
     if rr_salary_gk != '0':
@@ -1422,8 +2332,8 @@ def _compose_payment_sections(p: dict) -> dict:
         kpi_gk_str = _to_float_str_money(kpi_gk)
         gk_lines.append(f"\n→ Сумма KPI (OKK+Retention): {kpi_gk_str}₽")
     
-    # Only append block if salary > 0 (not counting base rate)
-    if stud_salary_gk_val > 0 or stud_salary_total > 0:
+    # Append block only if there are students (stud_gk > 0)
+    if stud_gk > 0:
         _append_block('[Сопровождение ГК]', gk_lines)
 
     gkp_lines = []
@@ -1433,8 +2343,6 @@ def _compose_payment_sections(p: dict) -> dict:
         gkp_lines.append(f"\nОклад за ученика: {base_val}₽")
     if stud_salary_gkp_val > 0 or _has_explicit(raw_stud_salary_gkp):
         gkp_lines.append(f"\n→ Сумма оклада: {stud_salary_gkp_val}₽")
-    if slivs_gkp > 0:
-        gkp_lines.append(f"\nКол-во сливов/киков (ГК+): {slivs_gkp}")
     if rr_gkp:
         gkp_lines.append(f"\nRetention ГК+: {rr_gkp}")
     if rr_salary_gkp != '0':
@@ -1450,8 +2358,8 @@ def _compose_payment_sections(p: dict) -> dict:
         kpi_gkp_str = _to_float_str_money(kpi_gkp)
         gkp_lines.append(f"\n→ Сумма KPI (OKK+Retention): {kpi_gkp_str}₽")
     
-    # Only append block if salary > 0 (not counting base rate)
-    if stud_salary_gkp_val > 0:
+    # Append block only if there are students (stud_gkp > 0)
+    if stud_gkp > 0:
         _append_block('[Сопровождение ГК+]', gkp_lines)
 
     if splitted_blocks:
@@ -1480,21 +2388,15 @@ def _compose_payment_sections(p: dict) -> dict:
     if not splitted_blocks:
         # Проверяем, есть ли хотя бы одно ненулевое значение в retention
         has_retention_data = (
-            slivs_gk > 0 or 
             (rr_salary_gk != '0' and _to_float_safe(rr_salary_gk) > 0) or
-            slivs_gkp > 0 or 
             (rr_salary_gkp != '0' and _to_float_safe(rr_salary_gkp) > 0)
         )
         if has_retention_data:
             retention_section = "\n[Retention]"
-            if slivs_gk > 0:
-                retention_section += f"\nКол-во сливов/киков в прошлом блоке ГК: {slivs_gk}"
             if rr_gk:
                 retention_section += f"\nRetention ГК: {rr_gk}"
             if rr_salary_gk != '0':
                 retention_section += f"\nОплата за retention ГК: {rr_salary_gk}₽"
-            if slivs_gkp > 0:
-                retention_section += f"\nКол-во сливов/киков в прошлом блоке ГК+: {slivs_gkp}"
             if rr_gkp:
                 retention_section += f"\nRetention ГК+: {rr_gkp}"
             if rr_salary_gkp != '0':
@@ -1682,7 +2584,8 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
         c.execute("""
             SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
             FROM vedomosti_users 
-            WHERE vk_id = ? AND state LIKE 'imported:%'
+            WHERE vk_id = ?
+              AND (state LIKE 'imported:%' OR state LIKE 'repet_imported:%')
             ORDER BY created_at DESC, id DESC
             LIMIT ?
         """, (str(user_id), limit))
@@ -1694,10 +2597,14 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
             try:
                 db_id, vk_id_raw, personal_path, original_filename, state, status_db, disagree_reason_db, confirmed_at_db, created_at_db = db_row
                 
-                if not state or not state.startswith('imported:'):
+                if not state or (not state.startswith('imported:') and not state.startswith('repet_imported:')):
                     continue
                 
-                parts = state.split(':', 1)
+                # Определяем тип выплаты
+                is_repet = state.startswith('repet_imported:')
+                prefix = 'repet_imported:' if is_repet else 'imported:'
+                
+                parts = state.split(prefix, 1)
                 if len(parts) != 2 or not parts[1]:
                     continue
                 
@@ -1720,10 +2627,15 @@ def get_all_payments_for_user_from_db(user_id: int, limit: int = 100):
                 else:
                     log.warning("Personal path not found for payment %s: %s", unique_payment_id, personal_path)
                 
-                payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+                # Для репетиторов используем отдельный маппер
+                if is_repet:
+                    payment_data = _map_row_to_repet_payment_data(row_dict, user_id, original_filename)
+                    payment_data['is_repet'] = True
+                else:
+                    payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+                    payment_data['is_repet'] = False
                 
-                # ВАЖНО: Добавляем personal_path в данные, чтобы format_payment_text 
-                # знала из какого именно файла загружать данные
+                # ВАЖНО: Добавляем personal_path в данные, чтобы форматтер знал источник
                 payment_data['personal_path'] = personal_path
                 
                 entry = {
@@ -1779,20 +2691,22 @@ def find_payment(user_id: int, payment_id: str):
                     WHERE id = ? AND vk_id = ?
                 """, (db_id, str(user_id)))
             except ValueError:
-                # Если не удалось извлечь db_id, пробуем старый способ
+                # Если не удалось извлечь db_id, пробуем старый способ (поддерживаем и imported, и repet_imported)
                 c.execute("""
                     SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
                     FROM vedomosti_users 
-                    WHERE vk_id = ? AND state = ?
-                """, (str(user_id), f"imported:{payment_id}"))
+                    WHERE vk_id = ?
+                      AND (state = ? OR state = ?)
+                """, (str(user_id), f"imported:{payment_id}", f"repet_imported:{payment_id}"))
         else:
-            # Старый формат payment_id
+            # Старый формат payment_id (поддерживаем и imported, и repet_imported)
             c.execute("""
                 SELECT id, vk_id, personal_path, original_filename, state, status, disagree_reason, confirmed_at, created_at 
                 FROM vedomosti_users 
-                WHERE vk_id = ? AND state = ?
+                WHERE vk_id = ?
+                  AND (state = ? OR state = ?)
                 LIMIT 1
-            """, (str(user_id), f"imported:{payment_id}"))
+            """, (str(user_id), f"imported:{payment_id}", f"repet_imported:{payment_id}"))
         
         row = c.fetchone()
         conn.close()
@@ -1814,7 +2728,18 @@ def find_payment(user_id: int, payment_id: str):
             except Exception:
                 log.warning("Failed to read CSV for find_payment %s path=%s", payment_id, personal_path)
         
-        payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+        # Определяем, является ли выплата репетиторской
+        is_repet = False
+        if state and state.startswith('repet_imported:'):
+            is_repet = True
+        
+        # Маппинг данных в зависимости от типа выплаты
+        if is_repet:
+            payment_data = _map_row_to_repet_payment_data(row_dict, user_id, original_filename)
+            payment_data['is_repet'] = True
+        else:
+            payment_data = _map_row_to_payment_data(row_dict, user_id, original_filename)
+            payment_data['is_repet'] = False
         
         # ВАЖНО: Добавляем personal_path в данные для правильного отображения
         payment_data['personal_path'] = personal_path
@@ -1844,12 +2769,18 @@ def find_payment(user_id: int, payment_id: str):
 
 def send_payment_message(user_id: int, payment_entry: dict):
     """Отправляет сообщение с текстом выплаты и inline-кнопками."""
-    text = "У тебя появилась новая ведомость на согласование 📋\n\n" + format_payment_text(payment_entry["data"])
+    is_repet = payment_entry.get("data", {}).get('is_repet', False)
+    
+    if is_repet:
+        text = "У тебя появилась новая ведомость на согласование 📋\n\n" + format_repet_payment_text(payment_entry["data"])
+    else:
+        text = "У тебя появилась новая ведомость на согласование 📋\n\n" + format_payment_text(payment_entry["data"])
+    
     keyboard = inline_confirm_keyboard(payment_id=payment_entry["id"])
     
     success = safe_vk_send(user_id, text, keyboard)
     if success:
-        log.info("Отправлена выплата %s user=%s", payment_entry["id"], user_id)
+        log.info("Отправлена выплата %s user=%s is_repet=%s", payment_entry["id"], user_id, is_repet)
     else:
         log.error("Не удалось отправить выплату %s user=%s", payment_entry.get("id"), user_id)
 
@@ -1910,24 +2841,63 @@ def handle_message_event(event):
             choice = payload.get("choice")
             payment_id = payload.get("payment_id")
             p = find_payment(user_id, payment_id)
+            is_repet = p.get("data", {}).get('is_repet', False) if p else False
             if choice == "agree":
                 if p:
                     p["status"] = "agree_pending_verify"
                     data = p.get("data", {})
                     phone = data.get("phone", "-")
-                    console_name = data.get("console", "-")
-                text = (
-                    "Проверь, пожалуйста, свои данные в приложении Консоль!\n\n"
-                    f"Номер телефона получателя: {phone}\n"
-                    f"ФИО получателя: {console_name}"
-                )
+                    
+                    # Преобразуем телефон в целое число (убираем .0 для кураторов)
+                    if phone != "-":
+                        try:
+                            # Если телефон представлен как float (например, 79517249750.0)
+                            if isinstance(phone, float):
+                                phone = str(int(phone))
+                            # Если телефон как строка с точкой
+                            elif isinstance(phone, str) and phone.endswith('.0'):
+                                phone = str(int(float(phone)))
+                            # Если просто число как строка
+                            elif phone.isdigit():
+                                phone = str(int(phone))
+                        except (ValueError, TypeError):
+                            # Если что-то пошло не так, оставляем как есть
+                            pass
+                    
+                    # Для репетиторов ФИО берём из 'fio', для кураторов — из 'console'
+                    if is_repet:
+                        console_name = data.get("fio") or data.get("console", "-")
+                    else:
+                        console_name = data.get("console", "-")
+                    
+                    text = (
+                        "Проверь, пожалуйста, свои данные в приложении Консоль!\n\n"
+                        f"Номер телефона получателя: {phone}\n"
+                        f"ФИО получателя: {console_name}"
+                    )
                 safe_vk_send(user_id, text, yes_no_keyboard("agree_verify", payment_id))
                 log.info("User %s started agree flow for payment %s (pending verify)", user_id, payment_id)
             else:
-                if p:
-                    p["status"] = "disagree_select_point"
-                safe_vk_send(user_id, "С каким пунктом вы не согласны:", payments_disagree_keyboard(payment_id=payment_id))
-                log.info("User %s disagreed payment %s -> asking for point (no persist)", user_id, payment_id)
+                if is_repet:
+                    # Для репетиторов сразу фиксируем несогласие и логируем в отдельную таблицу
+                    if p:
+                        p["status"] = "disagreed"
+                    try:
+                        update_vedomosti_status_by_payment(payment_id, "disagreed", reason="Данные выплаты")
+                    except Exception:
+                        log.exception("Failed to persist disagree for repet payment %s", payment_id)
+                    
+                    filename = p.get("data", {}).get("original_filename", "") if p else ""
+                    fio = p.get("data", {}).get("fio", "") if p else ""
+                    log_repet_complaint_to_sheet(user_id, "Данные выплаты", filename, fio)
+                    
+                    safe_vk_send(user_id, "В сообщении ниже опишите причину несогласия. В течение n количества времени с Вами свяжется оператор.")
+                    log.info("User %s disagreed repet payment %s -> logged to repet sheet", user_id, payment_id)
+                else:
+                    if p:
+                        p["status"] = "disagree_select_point"
+                    safe_vk_send(user_id, "С каким пунктом вы не согласны:", payments_disagree_keyboard(payment_id=payment_id))
+                    log.info("User %s disagreed payment %s -> asking for point (no persist)", user_id, payment_id)
         elif cmd == "agree_verify":
             payment_id = payload.get("payment_id")
             choice = payload.get("choice")
@@ -1940,12 +2910,21 @@ def handle_message_event(event):
                 log.info("User %s verified data for payment %s", user_id, payment_id)
             else:
                 p["status"] = "agree_data_mismatch"
-                safe_vk_send(user_id, "С Вами свяжется оператор.")
+                safe_vk_send(user_id, "С Вами свяжется оператор. Пожалуйста, напишите в сообщении ниже корректные данные.")
                 log.info("User %s reported data mismatch for payment %s", user_id, payment_id)
                 p = find_payment(user_id, payment_id)
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
                 filepath = f"hosting/open/{filename}" if filename else ""
-                log_complaint_to_sheet(user_id, "Не те данные в Консоли", filename, filepath)
+                fio = ""
+                is_repet = False
+                if p:
+                    data = p.get("data", {}) or {}
+                    fio = data.get("fio") or data.get("curator") or ""
+                    is_repet = data.get("is_repet", False)
+                if is_repet:
+                    log_repet_complaint_to_sheet(user_id, "Не те данные в Консоли", filename, fio)
+                else:
+                    log_complaint_to_sheet(user_id, "Не те данные в Консоли", filename, filepath, fio)
         elif cmd == "agree_pro":
             payment_id = payload.get("payment_id")
             choice = payload.get("choice")
@@ -1966,7 +2945,16 @@ def handle_message_event(event):
                 # Логируем отказ принять приглашение в Консоль ПРО в таблицу, чтобы оператор увидел
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
                 filepath = f"hosting/open/{filename}" if filename else ""
-                log_complaint_to_sheet(user_id, "Не принял приглашение в Консоль ПРО", filename, filepath)
+                fio = ""
+                is_repet = False
+                if p:
+                    data = p.get("data", {}) or {}
+                    fio = data.get("fio") or data.get("curator") or ""
+                    is_repet = data.get("is_repet", False)
+                if is_repet:
+                    log_repet_complaint_to_sheet(user_id, "Не принял приглашение в Консоль ПРО", filename, fio)
+                else:
+                    log_complaint_to_sheet(user_id, "Не принял приглашение в Консоль ПРО", filename, filepath, fio)
                 log.info("User %s has not accepted PRO invite for payment %s", user_id, payment_id)
         elif cmd == "disagree_reason":
             sid = payload.get("payment_id")
@@ -1981,26 +2969,45 @@ def handle_message_event(event):
                     log.exception("Failed to persist disagree (other reason) for %s", sid)
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
                 filepath = f"hosting/open/{filename}" if filename else ""
-                log_complaint_to_sheet(user_id, f"Иная причина (связаться с оператором)", filename, filepath)
-                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с Вами.")
+                fio = ""
+                is_repet = False
+                if p:
+                    data = p.get("data", {}) or {}
+                    fio = data.get("fio") or data.get("curator") or ""
+                    is_repet = data.get("is_repet", False)
+                if is_repet:
+                    log_repet_complaint_to_sheet(user_id, "Иная причина (связаться с оператором)", filename, fio)
+                else:
+                    log_complaint_to_sheet(user_id, "Иная причина (связаться с оператором)", filename, filepath, fio)
+                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с Вами. Опишите, пожалуйста, Вашу проблему в сообщении ниже.")
                 log.info("User %s chose other reason for %s -> operator handoff", user_id, sid)
                 return
             if p:
                 p["disagree_reason"] = reason
             filename = p.get("data", {}).get("original_filename", "") if p else ""
             filepath = f"hosting/open/{filename}" if filename else ""
-            log_complaint_to_sheet(user_id, f"Выбран пункт несогласия: {reason}", filename, filepath)
+            is_repet = False
+            if p:
+                is_repet = (p.get("data", {}) or {}).get("is_repet", False)
+            if is_repet:
+                log_repet_complaint_to_sheet(user_id, f"Выбран пункт несогласия: {reason}", filename, (p.get("data", {}) or {}).get("fio", ""))
+            else:
+                log_complaint_to_sheet(user_id, f"Выбран пункт несогласия: {reason}", filename, filepath)
             conflict_type = map_reason_to_type(reason)
             if conflict_type:
                 file_base = None
+                personal_path = None
                 try:
-                    fname = (p or {}).get("data", {}).get("original_filename")
+                    payment_data = (p or {}).get("data", {})
+                    fname = payment_data.get("original_filename")
                     if fname:
                         file_base = os.path.splitext(fname)[0]
+                    personal_path = payment_data.get("personal_path")
                 except Exception:
                     file_base = None
+                    personal_path = None
                 try:
-                    explanation = format_conflict(file_base or "", user_id, conflict_type)
+                    explanation = format_conflict(file_base or "", user_id, conflict_type, personal_path=personal_path)
                     if explanation:
                         safe_vk_send(user_id, explanation, disagreement_decision_keyboard(payment_id=sid, reason_label=reason))
                 except Exception:
@@ -2025,8 +3032,13 @@ def handle_message_event(event):
                     log.exception("Failed to persist disagreed for %s", sid)
                 filename = p.get("data", {}).get("original_filename", "") if p else ""
                 filepath = f"hosting/open/{filename}" if filename else ""
-                log_complaint_to_sheet(user_id, f"Не согласен с пунктом: {reason}", filename, filepath)
-                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с Вами.")
+                data = p.get("data", {}) or {}
+                is_repet = data.get("is_repet", False)
+                if is_repet:
+                    log_repet_complaint_to_sheet(user_id, f"Не согласен с пунктом: {reason}", filename, data.get("fio", ""))
+                else:
+                    log_complaint_to_sheet(user_id, f"Не согласен с пунктом: {reason}", filename, filepath)
+                safe_vk_send(user_id, "Сообщение передано оператору. Он скоро свяжется с Вами. Опишите, пожалуйста, Вашу проблему в сообщении ниже.")
                 log.info("User %s decided disagree_point for %s (persisted)", user_id, sid)
         elif cmd == "agree_payment":
             # Обработка кнопки "Согласиться с ведомостью" из общего списка
@@ -2048,7 +3060,30 @@ def handle_message_event(event):
                 p["status"] = "agree_pending_verify"
                 data = p.get("data", {})
                 phone = data.get("phone", "-")
-                console_name = data.get("console", "-")
+                is_repet = data.get('is_repet', False)
+                
+                # Преобразуем телефон, убирая .0 если есть
+                if phone != "-":
+                    # Если телефон приходит как float (например, 79517249750.0)
+                    if isinstance(phone, float):
+                        phone = str(int(phone))
+                    # Если телефон как строка с .0
+                    elif isinstance(phone, str) and phone.endswith('.0'):
+                        phone = str(int(float(phone)))
+                    # Если просто число как строка (без .0)
+                    elif isinstance(phone, str) and phone.replace('.', '', 1).isdigit():
+                        # Проверяем, есть ли точка
+                        if '.' in phone:
+                            phone = str(int(float(phone)))
+                        else:
+                            phone = str(int(phone))
+                
+                # Для репетиторов ФИО берём из 'fio', для кураторов — из 'console'
+                if is_repet:
+                    console_name = data.get("fio") or data.get("console", "-")
+                else:
+                    console_name = data.get("console", "-")
+                
                 text = (
                     "Проверь, пожалуйста, свои данные в приложении Консоль!\n\n"
                     f"Номер телефона получателя: {phone}\n"
@@ -2071,7 +3106,12 @@ def handle_message_event(event):
                     log.info("User %s tried to open already confirmed statement %s", user_id, sid)
                     return
                 
-                statement_text = "Открыта ведомость \n\n" + format_payment_text(p["data"])
+                # Выбираем форматирование в зависимости от типа выплаты (куратор / репетитор)
+                if p.get("data", {}).get("is_repet"):
+                    body = format_repet_payment_text(p["data"])
+                else:
+                    body = format_payment_text(p["data"])
+                statement_text = body
                 safe_vk_send(user_id, statement_text, inline_confirm_keyboard(payment_id=sid))
                 user_last_opened_payment[user_id] = sid  # Запоминаем последнюю открытую выплату
                 log.info("User %s opened statement %s (unique_payment_id=%s)", user_id, sid, sid)
@@ -2079,19 +3119,13 @@ def handle_message_event(event):
                 safe_vk_send(user_id, "Ведомость не найдена (возможно устарела).")
         elif cmd == "to_list":
             payments = get_all_payments_for_user_from_db(user_id)
-            if not payments:
-                safe_vk_send(user_id, "У Вас нет выплат.", chat_bottom_keyboard())
-                return
-            safe_vk_send(user_id, "Список ведомостей (выберите):", payments_list_keyboard_for_user(payments, page=0))
+            send_payments_list_multiple(user_id, payments, page=0)
             log.info("Sent payments list to %s", user_id)
             return
         elif cmd == "payments_page":
             page = int(payload.get("page", 0))
             payments = get_all_payments_for_user_from_db(user_id)
-            if not payments:
-                safe_vk_send(user_id, "У Вас нет выплат.")
-                return
-            safe_vk_send(user_id, f"Список ведомостей (страница {page+1}):", payments_list_keyboard_for_user(payments, page=page))
+            send_payments_list_multiple(user_id, payments, page=page)
             return
         else:
             safe_vk_send(user_id, f"Нажата inline-кнопка. Payload: {json.dumps(payload, ensure_ascii=False)}")
@@ -2125,11 +3159,30 @@ def handle_message_new(event):
                 safe_vk_send(from_id, "Ведомость не найдена. Откройте ведомость заново.")
                 return
             pid = p["id"]
+            is_repet = p.get("data", {}).get('is_repet', False)
             if text == "Согласен с выплатой":
                 p["status"] = "agree_pending_verify"
                 data = p.get("data", {})
                 phone = data.get("phone", "-")
-                console_name = data.get("console", "-")
+                if phone != "-":
+                    # Если телефон приходит как float (например, 79517249750.0)
+                    if isinstance(phone, float):
+                        phone = str(int(phone))
+                    # Если телефон как строка с .0
+                    elif isinstance(phone, str) and phone.endswith('.0'):
+                        phone = str(int(float(phone)))
+                    # Если просто число как строка (без .0)
+                    elif isinstance(phone, str) and phone.replace('.', '', 1).isdigit():
+                        # Проверяем, есть ли точка
+                        if '.' in phone:
+                            phone = str(int(float(phone)))
+                        else:
+                            phone = str(int(phone))
+                # Для репетиторов ФИО берём из 'fio', для кураторов — из 'console'
+                if is_repet:
+                    console_name = data.get("fio") or data.get("console", "-")
+                else:
+                    console_name = data.get("console", "-")
                 text_msg = (
                     "[Проверь, пожалуйста, свои данные в приложении Консоль!]\n\n"
                     f"Номер телефона получателя: {phone}\n"
@@ -2139,10 +3192,25 @@ def handle_message_new(event):
                 log.info("User %s started agree flow via text-button for %s", from_id, pid)
                 return
             else:
-                p["status"] = "disagree_select_point"
-                safe_vk_send(from_id, "С каким пунктом вы не согласны:", payments_disagree_keyboard(payment_id=pid))
-                log.info("User %s disagreed payment %s via text-button -> asking for point (no persist)", from_id, pid)
-                return
+                if is_repet:
+                    # Для репетиторов сразу фиксируем несогласие и логируем в отдельную таблицу
+                    p["status"] = "disagreed"
+                    try:
+                        update_vedomosti_status_by_payment(pid, "disagreed", reason="Данные выплаты")
+                    except Exception:
+                        log.exception("Failed to persist disagree for repet payment %s", pid)
+                    
+                    filename = p.get("data", {}).get("original_filename", "")
+                    fio = p.get("data", {}).get("fio", "")
+                    log_repet_complaint_to_sheet(from_id, "Данные выплаты", filename, fio)
+                    
+                    safe_vk_send(from_id, "В сообщении ниже опишите причину несогласия. В течение n количества времени с Вами свяжется оператор.")
+                    log.info("User %s disagreed repet payment %s via text-button -> logged to repet sheet", from_id, pid)
+                else:
+                    p["status"] = "disagree_select_point"
+                    safe_vk_send(from_id, "С каким пунктом вы не согласны:", payments_disagree_keyboard(payment_id=pid))
+                    log.info("User %s disagreed payment %s via text-button -> asking for point (no persist)", from_id, pid)
+                    return
         if payload_str:
             try:
                 payload = json.loads(payload_str)
@@ -2154,7 +3222,8 @@ def handle_message_new(event):
                 p = find_payment(from_id, sid)
                 if p:
                     log.info("User %s trying to open statement %s via payload with status: %s", from_id, sid, p.get("status"))
-                    if p.get("status") == "agreed":
+                    current_status = refresh_payment_status_from_db(p, from_id)
+                    if current_status == "agreed":
                         vk.messages.send(
                             user_id=from_id,
                             random_id=vk_api.utils.get_random_id(),
@@ -2163,7 +3232,11 @@ def handle_message_new(event):
                         log.info("User %s tried to open already confirmed statement %s via payload", from_id, sid)
                         return
                     
-                    statement_text = "Открыта ведомость \n\n" + format_payment_text(p["data"])
+                    if p.get("data", {}).get("is_repet"):
+                        body = format_repet_payment_text(p["data"])
+                    else:
+                        body = format_payment_text(p["data"])
+                    statement_text = body
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
@@ -2193,11 +3266,16 @@ def handle_message_new(event):
                         log.exception("Failed to persist disagree (other reason) for %s", sid)
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
-                    log_complaint_to_sheet(from_id, f"Иная причина (связаться с оператором)", filename, filepath)
+                    data = p.get("data", {}) or {}
+                    is_repet = data.get("is_repet", False)
+                    if is_repet:
+                        log_repet_complaint_to_sheet(from_id, "Иная причина (связаться с оператором)", filename, data.get("fio", ""))
+                    else:
+                        log_complaint_to_sheet(from_id, "Иная причина (связаться с оператором)", filename, filepath)
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Сообщение передано оператору. Он скоро свяжется с Вами."
+                        message="Сообщение передано оператору. Он скоро свяжется с Вами. Опишите, пожалуйста, Вашу проблему в сообщении ниже."
                     )
                     return
                 if p:
@@ -2205,14 +3283,18 @@ def handle_message_new(event):
                 conflict_type = map_reason_to_type(reason)
                 if conflict_type:
                     file_base = None
+                    personal_path = None
                     try:
-                        fname = (p or {}).get("data", {}).get("original_filename")
+                        payment_data = (p or {}).get("data", {})
+                        fname = payment_data.get("original_filename")
                         if fname:
                             file_base = os.path.splitext(fname)[0]
+                        personal_path = payment_data.get("personal_path")
                     except Exception:
                         file_base = None
+                        personal_path = None
                     try:
-                        explanation = format_conflict(file_base or "", from_id, conflict_type)
+                        explanation = format_conflict(file_base or "", from_id, conflict_type, personal_path=personal_path)
                         if explanation:
                             vk.messages.send(
                                 user_id=from_id,
@@ -2247,11 +3329,16 @@ def handle_message_new(event):
                         log.exception("Failed to persist disagreed for %s", sid)
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
-                    log_complaint_to_sheet(from_id, f"Не согласен с пунктом: {reason}", filename, filepath)
+                    data = p.get("data", {}) or {}
+                    is_repet = data.get("is_repet", False)
+                    if is_repet:
+                        log_repet_complaint_to_sheet(from_id, f"Не согласен с пунктом: {reason}", filename, data.get("fio", ""))
+                    else:
+                        log_complaint_to_sheet(from_id, f"Не согласен с пунктом: {reason}", filename, filepath)
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
-                        message="Сообщение передано оператору. Он скоро свяжется с Вами."
+                        message="Сообщение передано оператору. Он скоро свяжется с Вами. Опишите, пожалуйста, Вашу проблему в сообщении ниже."
                     )
                 return
             if cmd == "agree_payment":
@@ -2279,7 +3366,30 @@ def handle_message_new(event):
                     p["status"] = "agree_pending_verify"
                     data = p.get("data", {})
                     phone = data.get("phone", "-")
-                    console_name = data.get("console", "-")
+                    is_repet = data.get('is_repet', False)
+                    
+                    # Преобразуем телефон, убирая .0 если есть
+                    if phone != "-":
+                        # Если телефон приходит как float (например, 79517249750.0)
+                        if isinstance(phone, float):
+                            phone = str(int(phone))
+                        # Если телефон как строка с .0
+                        elif isinstance(phone, str) and phone.endswith('.0'):
+                            phone = str(int(float(phone)))
+                        # Если просто число как строка (без .0)
+                        elif isinstance(phone, str) and phone.replace('.', '', 1).isdigit():
+                            # Проверяем, есть ли точка
+                            if '.' in phone:
+                                phone = str(int(float(phone)))
+                            else:
+                                phone = str(int(phone))
+                    
+                    # Для репетиторов ФИО берём из 'fio', для кураторов — из 'console'
+                    if is_repet:
+                        console_name = data.get("fio") or data.get("console", "-")
+                    else:
+                        console_name = data.get("console", "-")
+                    
                     text = (
                         "Проверь, пожалуйста, свои данные в приложении Консоль!\n\n"
                         f"Номер телефона получателя: {phone}\n"
@@ -2321,37 +3431,13 @@ def handle_message_new(event):
                         p.get("data", {}).get("groups")  # Передаем информацию о группах
                     )
                     statements.append((p["id"], label))
-                vk.messages.send(
-                    user_id=from_id,
-                    random_id=vk_api.utils.get_random_id(),
-                    message="Список ведомостей (выберите):",
-                    keyboard=payments_list_keyboard_for_user(payments, page=0)
-                )
+                send_payments_list_multiple(from_id, payments, page=0, use_vk_direct=True)
                 log.info("Sent payments list to %s", from_id)
                 return
             if cmd == "payments_page":
                 page = int(payload.get("page", 0))
                 payments = get_all_payments_for_user_from_db(from_id)
-                if not payments:
-                    vk.messages.send(user_id=from_id, random_id=vk_api.utils.get_random_id(), message="У Вас нет выплат.")
-                    return
-                statements = []
-                for idx, p in enumerate(payments, start=1):
-                    label = _format_payment_label(
-                        p["data"].get('original_filename'), 
-                        idx,
-                        30,
-                        p.get("created_at"),
-                        p.get("db_id"),
-                        p.get("data", {}).get("groups")  # Передаем информацию о группах
-                    )
-                    statements.append((p["id"], label))
-                vk.messages.send(
-                    user_id=from_id,
-                    random_id=vk_api.utils.get_random_id(),
-                    message="Список ведомостей (страница {}):".format(page+1),
-                    keyboard=payments_list_keyboard_for_user(payments, page=page)
-                )
+                send_payments_list_multiple(from_id, payments, page=page, use_vk_direct=True)
                 return
             if cmd == "agree_verify":
                 sid = payload.get("payment_id")
@@ -2376,7 +3462,12 @@ def handle_message_new(event):
                     )
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
-                    log_complaint_to_sheet(from_id, "Не те данные в Консоли", filename, filepath)
+                    data = p.get("data", {}) or {}
+                    is_repet = data.get("is_repet", False)
+                    if is_repet:
+                        log_repet_complaint_to_sheet(from_id, "Не те данные в Консоли", filename, data.get("fio", ""))
+                    else:
+                        log_complaint_to_sheet(from_id, "Не те данные в Консоли", filename, filepath)
                 return
             if cmd == "agree_pro":
                 sid = payload.get("payment_id")
@@ -2405,7 +3496,12 @@ def handle_message_new(event):
                     # Логируем отказ принять приглашение в Консоль ПРО в таблицу
                     filename = p.get("data", {}).get("original_filename", "") if p else ""
                     filepath = f"hosting/open/{filename}" if filename else ""
-                    log_complaint_to_sheet(from_id, "Не подписал договор", filename, filepath)
+                    data = p.get("data", {}) or {}
+                    is_repet = data.get("is_repet", False)
+                    if is_repet:
+                        log_repet_complaint_to_sheet(from_id, "Не подписал договор", filename, data.get("fio", ""))
+                    else:
+                        log_complaint_to_sheet(from_id, "Не подписал договор", filename, filepath)
                 return
         if text.lower() == "к списку выплат" or text == "К списку выплат":
             payments = get_all_payments_for_user_from_db(from_id)
@@ -2421,12 +3517,7 @@ def handle_message_new(event):
             for idx, p in enumerate(payments, start=1):
                 label = _format_payment_label(p["data"].get('original_filename'), idx)
                 statements.append((p["id"], label))
-            vk.messages.send(
-                user_id=from_id,
-                random_id=vk_api.utils.get_random_id(),
-                message="Список ведомостей (выберите):",
-                keyboard=payments_list_keyboard_for_user(payments, page=0)
-            )
+            send_payments_list_multiple(from_id, payments, page=0, use_vk_direct=True)
             log.info("Sent payments list to %s", from_id)
             return
         m = re.match(r"^\s*Ведомость\s+(\d+)\s*$", text, flags=re.IGNORECASE)
@@ -2436,7 +3527,8 @@ def handle_message_new(event):
             if 0 <= idx < len(payments):
                 p = payments[idx]
                 log.info("User %s trying to open statement %s by text with status: %s", from_id, p["id"], p.get("status"))
-                if p.get("status") == "agreed":
+                current_status = refresh_payment_status_from_db(p, from_id)
+                if current_status == "agreed":
                     vk.messages.send(
                         user_id=from_id,
                         random_id=vk_api.utils.get_random_id(),
@@ -2444,7 +3536,11 @@ def handle_message_new(event):
                     )
                     log.info("User %s tried to open already confirmed statement %s by text", from_id, p["id"])
                     return
-                statement_text = f"Открыта ведомость \n\n" + format_payment_text(p["data"])
+                if p.get("data", {}).get("is_repet"):
+                    body = format_repet_payment_text(p["data"])
+                else:
+                    body = format_payment_text(p["data"])
+                statement_text = body
                 vk.messages.send(
                     user_id=from_id,
                     random_id=vk_api.utils.get_random_id(),
