@@ -259,7 +259,7 @@ def ensure_csv(path: str) -> Optional[str]:
         return None
 
 
-def publish_to_hosting(csv_path: str, subject: str, course_type: str, block: str, uploaded_by: int) -> Optional[str]:
+def publish_to_hosting(csv_path: str, subject: str, course_type: str, block: str, uploaded_by: int, excel_path: str = None) -> Optional[str]:
     if not os.path.exists(csv_path):
         log.warning('publish: file not found %s', csv_path)
         return None
@@ -286,11 +286,70 @@ def publish_to_hosting(csv_path: str, subject: str, course_type: str, block: str
 
     log.info('Published to hosting: %s (subject=%s course_type=%s block=%s)', dest_path, subject, course_type, block)
 
+    # Копируем Excel файл в ту же папку (нужен для расчёта RR - там хранятся min/max)
+    if excel_path and os.path.exists(excel_path) and excel_path.lower().endswith(('.xlsx', '.xls')):
+        excel_ext = os.path.splitext(excel_path)[1]
+        excel_fname = f"{subject_safe}_{course_safe}_{block_safe}{excel_ext}"
+        excel_dest = os.path.join(dest_dir, excel_fname)
+        try:
+            shutil.copy2(excel_path, excel_dest)
+            log.info('Copied Excel file to hosting: %s', excel_dest)
+        except Exception as e:
+            log.warning('Failed to copy Excel file to hosting: %s', e)
+
     # импортируем пользователей и создаём персональные файлы
     try:
         import_users_from_csv(dest_path, original_filename=os.path.basename(dest_path))
     except Exception:
         log.exception('Failed to import users from %s', dest_path)
+
+    return dest_path
+
+
+def publish_to_hosting_repet(csv_path: str, subject: str, course_type: str, block: str, uploaded_by: int, excel_path: str = None) -> Optional[str]:
+    """Публикует файл для репетиторов на хостинг."""
+    if not os.path.exists(csv_path):
+        log.warning('publish_repet: file not found %s', csv_path)
+        return None
+
+    subject_safe = subject if subject else 'unknown_subject'
+    course_safe = course_type if course_type else 'unknown_course'
+    block_safe = block if block else 'unknown_block'
+
+    dest_dir = os.path.join(HOSTING_ROOT, OPEN_DIRNAME, subject_safe, course_safe, block_safe)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except Exception:
+        log.exception('Failed to create dest dir %s', dest_dir)
+        return None
+
+    fname = f"{subject_safe}_{course_safe}_{block_safe}.csv"
+    dest_path = os.path.join(dest_dir, fname)
+
+    try:
+        shutil.move(csv_path, dest_path)
+    except Exception as e:
+        log.exception('Failed to move file to hosting: %s', e)
+        return None
+
+    log.info('Published repet to hosting: %s (subject=%s course_type=%s block=%s)', dest_path, subject, course_type, block)
+
+    # Копируем Excel файл в ту же папку (если есть)
+    if excel_path and os.path.exists(excel_path) and excel_path.lower().endswith(('.xlsx', '.xls')):
+        excel_ext = os.path.splitext(excel_path)[1]
+        excel_fname = f"{subject_safe}_{course_safe}_{block_safe}{excel_ext}"
+        excel_dest = os.path.join(dest_dir, excel_fname)
+        try:
+            shutil.copy2(excel_path, excel_dest)
+            log.info('Copied Excel file to hosting: %s', excel_dest)
+        except Exception as e:
+            log.warning('Failed to copy Excel file to hosting: %s', e)
+
+    # импортируем пользователей-репетиторов и создаём персональные файлы
+    try:
+        import_users_from_csv_repet(dest_path, original_filename=os.path.basename(dest_path))
+    except Exception:
+        log.exception('Failed to import repet users from %s', dest_path)
 
     return dest_path
 
@@ -445,6 +504,118 @@ def import_users_from_csv(dest_path: str, original_filename: str):
     log.info('Imported %s users from %s (vk_col=%s)', count, dest_path, vk_col)
 
 
+def import_users_from_csv_repet(dest_path: str, original_filename: str):
+    """Прочитать CSV для репетиторов и для каждой строки с колонкой ВК создать индивидуальный файл и запись в sqlite."""
+    if not os.path.exists(dest_path):
+        log.warning('import_repet: file not found %s', dest_path)
+        return
+
+    try:
+        df = pd.read_csv(dest_path, dtype=str)
+    except Exception:
+        try:
+            df = pd.read_csv(dest_path, encoding='cp1251', dtype=str)
+        except Exception:
+            log.exception('Failed to read CSV for import_repet %s', dest_path)
+            return
+
+    # поиск колонки ВК (содержит ссылки вида https://vk.com/id123456)
+    vk_col = None
+    for col in df.columns:
+        col_lower = str(col).strip().lower()
+        if col_lower in ['вк', 'vk']:
+            vk_col = col
+            break
+
+    if not vk_col:
+        log.info('CSV %s не содержит столбца ВК — импорт пропущен', dest_path)
+        return
+
+    users_dir = os.path.join(os.path.dirname(dest_path), 'users')
+    os.makedirs(users_dir, exist_ok=True)
+
+    # --------------------------
+    # Очищаем и сокращаем original_filename
+    orig = os.path.basename(original_filename or '')
+    orig = re.sub(r'^(?:\d+_){1,3}', '', orig)
+    orig_noext = os.path.splitext(orig)[0]
+    base_original = _safe_filename_component(orig_noext)[:50]
+    # --------------------------
+
+    timestamp = int(time.time())
+    count = 0
+    
+    # Оптимизация: группируем операции с БД
+    db_operations = []
+
+    for idx, row in df.iterrows():
+        try:
+            vk_link = row.get(vk_col, '')
+            if pd.isna(vk_link) or str(vk_link).strip() == '':
+                continue
+            
+            # Парсим VK ID из ссылки (https://vk.com/id123456)
+            vk_link_str = str(vk_link).strip()
+            match = re.search(r'vk\.com/id(\d+)', vk_link_str)
+            if match:
+                vk_str = match.group(1)
+            elif re.fullmatch(r'\d+', vk_link_str):
+                # Если это просто число
+                vk_str = vk_link_str
+            else:
+                log.warning('Cannot parse VK ID from: %s', vk_link_str)
+                continue
+            
+            vk_safe = _safe_filename_component(vk_str)
+
+            # Формируем читаемое и короткое имя:
+            personal_name = f"{vk_safe}_{timestamp}_{idx}_{base_original}.csv"
+            personal_path = os.path.join(users_dir, personal_name)
+
+            # extract single-row dataframe preserving columns/headers
+            try:
+                one = df.loc[[idx]]
+                one.to_csv(personal_path, index=False, encoding='utf-8')
+            except Exception:
+                try:
+                    one.to_csv(personal_path, index=False, encoding='cp1251')
+                except Exception:
+                    log.exception('Failed to write personal file for %s', vk_str)
+                    continue
+
+            # Добавляем операцию в очередь вместо немедленного выполнения
+            db_operations.append((vk_str, personal_path, original_filename))
+            count += 1
+            log.info('Created personal file for repet vk_id=%s -> %s', vk_str, personal_path)
+        except Exception:
+            log.exception('Error processing row %s in %s', idx, dest_path)
+
+    # Выполняем все операции с БД одним пакетом
+    if db_operations:
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            c = conn.cursor()
+            now = int(time.time())
+            archive_time = now + (36 * 3600)  # 36 часов в секундах
+
+            # Для КАЖДОЙ строки создаём уникальный идентификатор состояния с префиксом repet_
+            for vk_str, personal_path, orig_fn in db_operations:
+                unique_state = f"repet_imported:{uuid.uuid4()}"
+                log.info('Creating unique state for repet vk_id=%s: %s', vk_str, unique_state)
+                c.execute(
+                    'INSERT INTO vedomosti_users(vk_id, personal_path, original_filename, state, created_at, archive_at) VALUES (?,?,?,?,?,?)',
+                    (str(vk_str), personal_path, orig_fn, unique_state, now, archive_time)
+                )
+
+            conn.commit()
+            conn.close()
+            log.info('Bulk inserted %d repet vedomosti users to database with unique states', len(db_operations))
+        except Exception:
+            log.exception('Failed to bulk insert repet vedomosti users')
+
+    log.info('Imported %s repet users from %s (vk_col=%s)', count, dest_path, vk_col)
+
+
 # ----------------- helpers -----------------
 
 def is_admin(user_id: int) -> bool:
@@ -569,6 +740,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/update <название ведомости> — обновить данные в существующей ведомости (заменить файл и уведомить пользователей с изменениями)\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
+        '/find <VK ID или ссылка> — поиск ведомостей по VK ID пользователя\n'
+        'Пример: /find https://vk.com/id160898445\n'
         '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК\n'
         '/delete <название1> <название2> ... - удалить одну или несколько архивных ведомостей\n'
     )
@@ -587,6 +760,8 @@ async def description(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/notify <название ведомости> — рассылка уведомлений пользователям конкретной ведомости\n'
         '/update <название ведомости> — обновить данные в существующей ведомости (заменить файл и уведомить пользователей с изменениями)\n'
         '/liststatements — показать список всех открытых и архивных ведомостей\n'
+        '/find <VK ID или ссылка> — поиск ведомостей по VK ID пользователя\n'
+        'Пример: /find https://vk.com/id160898445\n'
         '/archive <название ведомости> - ведомость переместится в архивную сразу же, она исчезнет у Кураторов в интерфейсе ВК\n'
         '/delete <название1> <название2> ... - удалить одну или несколько архивных ведомостей\n'
     )
@@ -609,7 +784,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     os.makedirs(UPLOADS_DIR, exist_ok=True)
-    safe_title = (filename)
+    # Санитизируем имя файла (убираем проблемные символы, но сохраняем расширение)
+    name_part, ext_part = os.path.splitext(filename)
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name_part)  # Убираем запрещённые символы
+    safe_title = safe_name + ext_part
     local_name = safe_title
     local_path = os.path.join(UPLOADS_DIR, local_name)
 
@@ -626,7 +804,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply = ('Файл сохранён, ожидает публикации.\n'
              'Отправьте инфу командой: /send <предмет> <тип курса> <блок>\n'
-             'Пример: /send Русский ОГЭ ПГК\n\n'
+             'Пример: /send Русский ОГЭ ПГК\n'
+             'Для репетиторов: /send_repet <предмет> <тип курса> <блок>\n'
+             'Пример: /send_repet Физика ОГЭ 1\n\n'
              'Для обновления существующей ведомости используйте: /update <название ведомости>')
     if not DRY_RUN:
         await msg.reply_text(reply)
@@ -674,7 +854,15 @@ async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Ошибка при чтении БД для рассылки. Смотри логи.')
         return
 
-    vk_ids = [r[0] for r in rows if r and str(r[0]).strip()]
+    # Извлекаем числовые VK ID из значений (могут быть ссылки или числа)
+    vk_ids_raw = [r[0] for r in rows if r and str(r[0]).strip()]
+    vk_ids = []
+    for raw_id in vk_ids_raw:
+        extracted = extract_vk_id(str(raw_id))
+        if extracted:
+            vk_ids.append(extracted)
+        else:
+            log.warning('Could not extract numeric vk_id from: %s', raw_id)
     vk_ids = list(dict.fromkeys(vk_ids))  # unique preserving order
 
     total = len(vk_ids)
@@ -821,6 +1009,211 @@ async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary += f"\nНе доставлено:\n{column}{more_suffix}"
 
     await update.message.reply_text(summary)
+
+
+async def notify_repet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /notify_repet — рассылка для репетиторов, берёт VK из столбца 'ВК' (ссылки)."""
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text('Только админы могут отправлять рассылки.')
+        return
+
+    if context.args:
+        subject = ' '.join(context.args).strip()
+    else:
+        await update.message.reply_text('Не указано название ведомости.\nИспользование: /notify_repet <название ведомости>')
+        return
+
+    try:
+        # Нормализуем название
+        subject_normalized = subject.replace(' ', '_')
+        target_filename = subject_normalized + '.csv'
+        
+        # Ищем CSV файл ведомости
+        csv_path = None
+        open_path = os.path.join(HOSTING_ROOT, OPEN_DIRNAME)
+        
+        if os.path.exists(open_path):
+            for root, dirs, files in os.walk(open_path):
+                if 'users' in root:
+                    continue
+                for file in files:
+                    if file == target_filename:
+                        csv_path = os.path.join(root, file)
+                        break
+                    # Гибкий поиск
+                    file_normalized = file.replace('.csv', '').replace('_', ' ').lower()
+                    subject_check = subject.replace('_', ' ').lower()
+                    if subject_check in file_normalized or file_normalized in subject_check:
+                        csv_path = os.path.join(root, file)
+                        break
+                if csv_path:
+                    break
+        
+        if not csv_path or not os.path.exists(csv_path):
+            await update.message.reply_text(f'Файл ведомости "{subject}" не найден.\nИспользуйте /liststatements для просмотра доступных ведомостей.')
+            return
+        
+        # Читаем CSV и извлекаем VK ID из столбца "ВК"
+        try:
+            df = pd.read_csv(csv_path, dtype=str)
+        except Exception:
+            try:
+                # Часто файлы в Windows-1251
+                df = pd.read_csv(csv_path, encoding='cp1251', dtype=str)
+            except Exception:
+                # В крайнем случае читаем с игнорированием битых символов
+                df = pd.read_csv(csv_path, encoding='utf-8', encoding_errors='ignore', dtype=str)
+        
+        # Ищем столбец с VK ссылками (может называться "ВК", "VK", "vk")
+        vk_column = None
+        for col in df.columns:
+            col_lower = col.strip().lower()
+            if col_lower in ['вк', 'vk']:
+                vk_column = col
+                break
+        
+        if not vk_column:
+            await update.message.reply_text(f'Столбец "ВК" не найден в файле {target_filename}.\nДоступные столбцы: {", ".join(df.columns[:10])}')
+            return
+        
+        # Извлекаем VK ID из ссылок
+        vk_ids = []
+        for vk_link in df[vk_column].dropna():
+            vk_link = str(vk_link).strip()
+            if not vk_link:
+                continue
+            # Парсим ссылку типа https://vk.com/id123456 или vk.com/id123456
+            match = re.search(r'vk\.com/id(\d+)', vk_link)
+            if match:
+                vk_ids.append(match.group(1))
+            elif re.fullmatch(r'\d+', vk_link):
+                # Если это просто число
+                vk_ids.append(vk_link)
+        
+        vk_ids = list(dict.fromkeys(vk_ids))  # unique
+        
+    except Exception:
+        log.exception('Failed to read CSV for notify_repet')
+        await update.message.reply_text('Ошибка при чтении файла ведомости. Смотри логи.')
+        return
+
+    total = len(vk_ids)
+    
+    if total == 0:
+        await update.message.reply_text(f'Не найдено VK пользователей в ведомости "{subject}".\nПроверьте столбец "ВК" в файле.')
+        return
+    
+    await update.message.reply_text(f'Начинаю рассылку для ведомости репетиторов "{subject}".\nНайдено VK пользователей: {total}')
+    
+    sent = 0
+    failed = 0
+    failed_list = []
+
+    text_plain = NOTIFY_TEXT or "У вас появилась новая выплата, проверьте список выплат."
+
+    for vk_id in vk_ids:
+        try:
+            resp = requests.get(
+                'https://api.vk.com/method/messages.send',
+                params={
+                    'access_token': VK_TOKEN,
+                    'user_id': vk_id,
+                    'random_id': 0,
+                    'message': text_plain,
+                    'v': '5.131'
+                },
+                timeout=10
+            )
+            data = resp.json()
+            if 'response' in data:
+                sent += 1
+                log.info('VK notify_repet sent to %s', vk_id)
+            else:
+                failed += 1
+                failed_list.append(vk_id)
+                log.warning('VK notify_repet failed to %s: %s', vk_id, data)
+        except Exception as e:
+            log.exception('VK notify_repet error for %s: %s', vk_id, e)
+            failed += 1
+            failed_list.append(vk_id)
+
+    summary = f'Рассылка репетиторам завершена. Всего: {total}, успешно: {sent}, неудач: {failed}.'
+    if failed_list:
+        sample_ids = list(map(str, failed_list[:20]))
+        more_suffix = f"\n...(+{len(failed_list)-20} ещё)" if len(failed_list) > 20 else ""
+        column = "\n".join(sample_ids)
+        summary += f"\nНе доставлено:\n{column}{more_suffix}"
+
+    await update.message.reply_text(summary)
+
+
+async def send_keyboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /send_keyboard <vk_id> — отправляет клавиатуру с кнопкой 'К списку выплат' конкретному пользователю."""
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text('Только админы могут использовать эту команду.')
+        return
+
+    if not context.args:
+        await update.message.reply_text('Не указан VK ID.\nИспользование: /send_keyboard <vk_id>\nПример: /send_keyboard 123456789')
+        return
+
+    vk_id_raw = context.args[0].strip()
+    
+    # Извлекаем числовой VK ID (может быть ссылка или число)
+    vk_id = extract_vk_id(vk_id_raw)
+    if not vk_id:
+        await update.message.reply_text(f'Неверный формат VK ID: {vk_id_raw}\nУкажите числовой ID или ссылку на профиль.')
+        return
+
+    # Формируем клавиатуру
+    keyboard_json = json.dumps({
+        "one_time": False,
+        "inline": False,
+        "buttons": [
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "payload": json.dumps({"cmd": "to_list"}, ensure_ascii=False),
+                        "label": "К списку выплат"
+                    },
+                    "color": "primary"
+                }
+            ]
+        ]
+    }, ensure_ascii=False)
+
+    # Отправляем сообщение с клавиатурой
+    try:
+        resp = requests.post(
+            'https://api.vk.com/method/messages.send',
+            data={
+                'access_token': VK_TOKEN,
+                'v': '5.131',
+                'user_id': vk_id,
+                'message': 'Нажмите на кнопку "К списку выплат" чтобы увидеть ваши ведомости.',
+                'random_id': int(time.time() * 1000) & 0x7fffffff,
+                'group_id': GROUP_ID,
+                'keyboard': keyboard_json
+            },
+            timeout=10
+        )
+        data = resp.json()
+        
+        if 'response' in data:
+            await update.message.reply_text(f'✅ Клавиатура успешно отправлена пользователю VK ID: {vk_id}')
+            log.info('Keyboard sent to VK user %s', vk_id)
+        else:
+            error_msg = data.get('error', {}).get('error_msg', 'Неизвестная ошибка')
+            await update.message.reply_text(f'❌ Ошибка отправки: {error_msg}')
+            log.warning('Failed to send keyboard to %s: %s', vk_id, data)
+    except Exception as e:
+        log.exception('Error sending keyboard to %s', vk_id)
+        await update.message.reply_text(f'❌ Ошибка: {e}')
+
+
 # ----------------- other command handlers (unchanged) -----------------
 
 async def _process_send_command(from_id: int, text: str, msg_reply_func):
@@ -850,6 +1243,9 @@ async def _process_send_command(from_id: int, text: str, msg_reply_func):
             log.info('[DRY RUN] %s', reply)
         return
 
+    # Сохраняем путь к оригинальному Excel файлу (если это Excel)
+    original_excel_path = file_path if file_path.lower().endswith(('.xlsx', '.xls')) else None
+
     csv_path = ensure_csv(file_path)
     if not csv_path:
         reply = f'Не удалось обработать файл {file_path} (чтение/конвертация).'
@@ -859,7 +1255,7 @@ async def _process_send_command(from_id: int, text: str, msg_reply_func):
             log.info('[DRY RUN] %s', reply)
         return
 
-    dest = publish_to_hosting(csv_path, subject, course_type, block, uploaded_by=from_id)
+    dest = publish_to_hosting(csv_path, subject, course_type, block, uploaded_by=from_id, excel_path=original_excel_path)
     if dest:
         save_current_for_user(from_id, file_path='', awaiting_meta=False)
         reply = (f'Ведомость опубликована: {dest}\n'
@@ -883,6 +1279,72 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def reply_func(text):
         await msg.reply_text(text)
     await _process_send_command(from_id, msg.text or '', reply_func)
+
+
+async def _process_send_repet_command(from_id: int, text: str, msg_reply_func):
+    """Обработка команды /send_repet для репетиторов."""
+    text = (text or '').strip()
+    
+    # Убираем /send_repet из начала
+    if text.lower().startswith('/send_repet'):
+        text = text[11:].strip()
+    
+    # Разбиваем по пробелам и берем первые 3 части
+    parts = text.split()
+    if len(parts) < 3:
+        await msg_reply_func('Недостаточно параметров. Используйте: /send_repet <предмет> <тип курса> <блок>')
+        return
+
+    subject = parts[0].strip()
+    course_type = parts[1].strip()
+    block = parts[2].strip()
+
+    cur = load_current_for_user(from_id)
+    file_path = cur.get('file_path', '')
+    if not file_path:
+        reply = 'Нет ожидающего файла. Сначала пришлите файл (CSV/XLSX).'
+        if not DRY_RUN:
+            await msg_reply_func(reply)
+        else:
+            log.info('[DRY RUN] %s', reply)
+        return
+
+    # Сохраняем путь к оригинальному Excel файлу (если это Excel)
+    original_excel_path = file_path if file_path.lower().endswith(('.xlsx', '.xls')) else None
+
+    csv_path = ensure_csv(file_path)
+    if not csv_path:
+        reply = f'Не удалось обработать файл {file_path} (чтение/конвертация).'
+        if not DRY_RUN:
+            await msg_reply_func(reply)
+        else:
+            log.info('[DRY RUN] %s', reply)
+        return
+
+    dest = publish_to_hosting_repet(csv_path, subject, course_type, block, uploaded_by=from_id, excel_path=original_excel_path)
+    if dest:
+        save_current_for_user(from_id, file_path='', awaiting_meta=False)
+        reply = (f'Ведомость для репетиторов опубликована: {dest}\n'
+                 f'Название ведомости: {os.path.basename(dest)}')
+    else:
+        reply = 'Публикация не удалась.'
+
+    if not DRY_RUN:
+        await msg_reply_func(reply)
+    else:
+        log.info('[DRY RUN] %s', reply)
+
+
+async def send_repet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /send_repet для публикации ведомостей репетиторов."""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /send_repet from non-admin %s', from_id)
+        await msg.reply_text('Только админы могут публиковать файлы.')
+        return
+    await _process_send_repet_command(from_id, msg.text or '', msg.reply_text)
+
 
 async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -1329,15 +1791,85 @@ def update_statement_data(statement_folder: str, target_filename: str, new_csv_p
         def _normalize_value(val):
             if pd.isna(val) or val is None:
                 return ''
-            return str(val).strip()
+            s = str(val).strip()
+            # Нормализуем пустые строки и "0"
+            if not s or s.lower() in ('nan', 'none', '-', '—'):
+                return ''
+            # Убираем лишние пробелы
+            s = ' '.join(s.split())
+            return s
 
         def _get_field(row_dict: dict, field_name: str):
+            # Маппинг английских названий на русские альтернативы
+            field_aliases = {
+                'name': ['Куратор', 'ФИО', 'fio', 'curator', 'ФИО, которое указано в консоли'],
+                'type': ['Тип куратора', 'type', 'curator_type'],
+                'email': ['Почта', 'mail', 'Email'],
+                'phone': ['Телефон', 'phone', 'Номер телефона', 'Номер телефона, который указан в консоли'],
+                'console': ['Console', 'console', 'ФИО, которое указано в консоли'],
+                'groups': ['Группы', 'groups', 'group'],
+                'stud_all': ['Всего учеников', 'Всего детей', 'total_children', 'stud_all'],
+                'stud_gk': ['Всего детей - ГК', 'Всего учеников - ГК', 'stud_gk'],
+                'stud_gkp': ['Всего учеников - ГК+', 'Всего детей - ГК+', 'stud_gkp'],
+                'stud_rep': ['Колво учеников с тарифом с репетитором', 'with_tutor', 'stud_rep'],
+                'rep_salary': ['Доплата за учеников с репетитором', 'rep_salary'],
+                'base': ['Оклад за ученика', 'salary_per_student', 'base'],
+                'stud_salary': ['Сумма оклада', 'salary_sum', 'stud_salary'],
+                'stud_salary_gk': ['Сумма оклада ГК', 'stud_salary_gk', 'salary_gk'],
+                'stud_salary_gkp': ['Сумма оклада ГК+', 'stud_salary_gkp', 'salary_gkp'],
+                'class': ['class', 'Класс', 'курс'],
+                'slivs': ['Кол-во сливов', 'slivs'],
+                'slivs_gk': ['Кол-во сливов/киков в прошлом блоке ГК', 'slivs_gk'],
+                'slivs_gkp': ['Кол-во сливов/киков в прошлом блоке ГК+', 'slivs_gkp'],
+                'rr': ['retention', 'Retention', 'rr'],
+                'rr_salary': ['Оплата за retention', 'retention_pay', 'rr_salary'],
+                'rr_gk': ['retention ГК', 'rr_gk'],
+                'rr_salary_gk': ['Оплата за retention ГК', 'rr_salary_gk'],
+                'rr_gkp': ['retention ГК+', 'rr_gkp'],
+                'rr_salary_gkp': ['Оплата за retention ГК+', 'rr_salary_gkp'],
+                'okk': ['okk', 'OKK', 'ОКК'],
+                'okk_salary': ['Оплата за okk', 'okk_pay', 'okk_salary'],
+                'okk_gk': ['okk ГК', 'OKK ГК', 'okk_gk'],
+                'okk_salary_gk': ['Оплата за okk ГК', 'okk_salary_gk'],
+                'okk_gkp': ['okk ГК+', 'OKK ГК+', 'okk_gkp'],
+                'okk_salary_gkp': ['Оплата за okk ГК+', 'okk_salary_gkp'],
+                'kpi_total': ['Сумма КПИ', 'Сумма КПИ (okk+retention)', 'kpi_sum', 'kpi_total'],
+                'checks_all': ['Сумма за проверки за всё время', 'checks_calc', 'checks_all'],
+                'checks_prev': ['Сумма за проверки в прошлом периоде', 'checks_prev'],
+                'checks_salary': ['Сумма к оплате за проверки', 'checks_sum', 'checks_salary'],
+                'dop_checks': ['Доп. проверки', 'extra_checks', 'dop_checks'],
+                'up': ['УП', 'support', 'up'],
+                'chats': ['Чаты', 'chats'],
+                'webs': ['Вебы', 'webinars', 'webs'],
+                'meth': ['Стол заказов', 'orders_table', 'meth'],
+                'dop_sk': ['Премия от СК', 'bonus', 'dop_sk'],
+                'callsg': ['Групповые созв.', 'group_calls', 'callsg'],
+                'callsp': ['Индивидуальные созвоны', 'individual_calls', 'callsp'],
+                'fines': ['Все штрафы', 'Штрафы', 'penalties', 'fines'],
+                'total': ['Всего к выплате', 'Итого', 'total', 'Total'],
+                'comment': ['Комментарий', 'comment', 'Comment'],
+            }
+            
+            # Прямое совпадение
             if field_name in row_dict:
                 return row_dict.get(field_name)
+            
+            # Поиск по альтернативным названиям
+            aliases = field_aliases.get(field_name, [])
+            for alias in aliases:
+                if alias in row_dict:
+                    return row_dict.get(alias)
+                # Поиск без учета регистра
+                for key in row_dict.keys():
+                    if str(key).strip().lower() == alias.lower():
+                        return row_dict.get(key)
+            
+            # Поиск по частичному совпадению названия поля
             target = field_name.strip().lower()
             for key, value in row_dict.items():
                 if str(key).strip().lower() == target:
                     return value
+            
             return ''
 
         # Читаем новый CSV файл
@@ -1379,67 +1911,180 @@ def update_statement_data(statement_folder: str, target_filename: str, new_csv_p
             log.error('Old CSV file is empty or missing vk_id column')
             return False, []
         
-        # Создаем словари для быстрого поиска по vk_id
+        # Создаем словари для быстрого поиска по уникальному ключу (vk_id + groups)
+        # Это позволяет поддерживать несколько строк для одного vk_id (например, куратор на разных предметах)
+        def make_unique_key(row):
+            raw_vk_id = str(row.get('vk_id', '')).strip()
+            vk_id = extract_vk_id(raw_vk_id)
+            if not vk_id:
+                return None
+            groups = str(row.get('groups', '')).strip()
+            # Используем vk_id + groups как уникальный ключ
+            return f"{vk_id}_{groups}" if groups else vk_id
+        
+        # Функция для нормализации groups (убираем лишние пробелы вокруг запятых)
+        def normalize_groups(groups_str):
+            if not groups_str:
+                return ''
+            # Разбиваем по запятой, убираем пробелы, соединяем обратно
+            return ','.join([g.strip() for g in str(groups_str).split(',') if g.strip()])
+        
         old_data = {}
-        for _, row in old_df.iterrows():
-            vk_id = str(row.get('vk_id', '')).strip()
-            if vk_id and vk_id != 'nan':
-                old_data[vk_id] = row.to_dict()
+        vk_id_counters_old = {}  # Счётчик для случаев без groups
+        for idx, row in old_df.iterrows():
+            raw_vk_id = str(row.get('vk_id', '')).strip()
+            vk_id = extract_vk_id(raw_vk_id)
+            if not vk_id:
+                continue
+            groups = str(row.get('groups', '')).strip()
+            groups_normalized = normalize_groups(groups)
+            if groups_normalized:
+                unique_key = f"{vk_id}_{groups_normalized}"
+            else:
+                # Если groups пустой, используем счётчик
+                counter = vk_id_counters_old.get(vk_id, 0)
+                unique_key = f"{vk_id}_idx{counter}"
+                vk_id_counters_old[vk_id] = counter + 1
+            old_data[unique_key] = {'vk_id': vk_id, 'row': row.to_dict(), 'groups': groups}
         
         new_data = {}
-        for _, row in new_df.iterrows():
-            vk_id = str(row.get('vk_id', '')).strip()
-            if vk_id and vk_id != 'nan':
-                new_data[vk_id] = row.to_dict()
+        vk_id_counters_new = {}
+        for idx, row in new_df.iterrows():
+            raw_vk_id = str(row.get('vk_id', '')).strip()
+            vk_id = extract_vk_id(raw_vk_id)
+            if not vk_id:
+                continue
+            groups = str(row.get('groups', '')).strip()
+            groups_normalized = normalize_groups(groups)
+            if groups_normalized:
+                unique_key = f"{vk_id}_{groups_normalized}"
+            else:
+                counter = vk_id_counters_new.get(vk_id, 0)
+                unique_key = f"{vk_id}_idx{counter}"
+                vk_id_counters_new[vk_id] = counter + 1
+            new_data[unique_key] = {'vk_id': vk_id, 'row': row.to_dict(), 'groups': groups}
+        
+        log.info('Update comparison: old_csv=%s, new_csv=%s', old_csv_path, new_csv_path)
+        log.info('Update comparison: old_data has %d entries, new_data has %d entries', len(old_data), len(new_data))
+        log.info('Update comparison: old_data keys=%s', list(old_data.keys())[:5])
+        log.info('Update comparison: new_data keys=%s', list(new_data.keys())[:5])
         
         # Находим пользователей с изменениями
-        updated_users = []
+        updated_users = []  # Список vk_id с изменениями (может содержать дубликаты если у vk_id несколько строк)
+        updated_entries = []  # Список (vk_id, groups, new_row) для обновления personal файлов
         users_dir = os.path.join(statement_folder, 'users')
-        
-        for vk_id, new_row in new_data.items():
-            old_row = old_data.get(vk_id, {})
             
             # Сравниваем ключевые поля (исключаем служебные поля)
-            key_fields = [
-                'name', 'type', 'email', 'phone', 'console', 'groups',
-                'stud_all', 'stud_gk', 'stud_gkp', 'stud_rep', 'rep_salary', 'base', 'stud_salary',
-                'slivs', 'slivs_gk', 'slivs_gkp',
-                'rr', 'rr_salary', 'rr_gk', 'rr_salary_gk', 'rr_gkp', 'rr_salary_gkp',
-                'okk', 'okk_salary', 'okk_gk', 'okk_salary_gk', 'okk_gkp', 'okk_salary_gkp',
-                'kpi_total', 'checks_all', 'checks_prev', 'checks_salary', 'dop_checks',
-                'up', 'chats', 'webs', 'meth', 'dop_sk', 'callsg', 'callsp',
-                'fines', 'total', 'comment'
-            ]
+        key_fields = [
+            'name', 'type', 'class', 'email', 'phone', 'console', 'comment',
+            'stud_all', 'stud_gk', 'stud_gkp', 'stud_rep', 'rep_salary', 'base', 
+            'stud_salary', 'stud_salary_gk', 'stud_salary_gkp',
+            'slivs', 'slivs_gk', 'slivs_gkp',
+            'rr', 'rr_salary', 'rr_gk', 'rr_salary_gk', 'rr_gkp', 'rr_salary_gkp',
+            'okk', 'okk_salary', 'okk_gk', 'okk_salary_gk', 'okk_gkp', 'okk_salary_gkp',
+            'kpi_total', 'checks_all', 'checks_prev', 'checks_salary', 'dop_checks',
+            'up', 'chats', 'webs', 'meth', 'dop_sk', 'callsg', 'callsp',
+            'fines', 'total'
+        ]
+        
+        for unique_key, new_entry in new_data.items():
+            vk_id = new_entry['vk_id']
+            new_row = new_entry['row']
+            groups = new_entry['groups']
+            
+            old_entry = old_data.get(unique_key)
+            
+            # Если записи нет в старом файле по unique_key, пробуем найти по vk_id
+            if not old_entry:
+                # Ищем любую запись с таким же vk_id (на случай если изменились только groups)
+                for old_key, old_val in old_data.items():
+                    if old_val.get('vk_id') == vk_id:
+                        old_entry = old_val
+                        log.info('Update: key=%s vk_id=%s found by vk_id match (old_key=%s, new_key=%s)', 
+                                unique_key, vk_id, old_key, unique_key)
+                        break
+            
+            # Если записи нет в старом файле - это новая запись, пропускаем
+            if not old_entry:
+                log.debug('Update: key=%s vk_id=%s is NEW (not in old file), skipping', unique_key, vk_id)
+                continue
+            
+            old_row = old_entry.get('row', {})
+            
+            # Если old_row пустой, пропускаем
+            if not old_row:
+                log.debug('Update: key=%s vk_id=%s has empty old_row, skipping', unique_key, vk_id)
+                continue
             
             has_changes = False
+            changed_field = None
             for field in key_fields:
                 old_val = _normalize_value(_get_field(old_row, field))
                 new_val = _normalize_value(_get_field(new_row, field))
                 if old_val != new_val:
                     has_changes = True
+                    changed_field = field
+                    log.info('Update: key=%s vk_id=%s field=%s changed: old="%s" new="%s"', unique_key, vk_id, field, old_val[:50] if old_val else '', new_val[:50] if new_val else '')
                     break
             
+            if not has_changes and unique_key in list(new_data.keys())[:2]:
+                # Логируем первые 2 записи для отладки
+                log.info('Update: key=%s vk_id=%s NO changes detected. Sample old_row keys: %s', unique_key, vk_id, list(old_row.keys())[:10])
+                log.info('Update: key=%s vk_id=%s Sample new_row keys: %s', unique_key, vk_id, list(new_row.keys())[:10])
+                sample_fields = ['total', 'comment', 'stud_gk', 'kpi_total', 'checks_salary']
+                for sf in sample_fields:
+                    old_v = _normalize_value(_get_field(old_row, sf))
+                    new_v = _normalize_value(_get_field(new_row, sf))
+                    log.info('Update: key=%s field=%s: old="%s" new="%s" match=%s', unique_key, sf, old_v[:30] if old_v else '', new_v[:30] if new_v else '', old_v == new_v)
+            
             if has_changes:
-                updated_users.append(vk_id)
-                
-                # Обновляем персональный файл пользователя
-                personal_files = []
-                for file in os.listdir(users_dir):
+                if vk_id not in updated_users:
+                    updated_users.append(vk_id)
+                updated_entries.append((vk_id, groups, new_row))
+            else:
+                log.debug('Update: key=%s vk_id=%s NO changes', unique_key, vk_id)
+        
+        log.info('Update comparison: checked %d entries, found %d with changes, %d unique users to notify', 
+                 len(new_data), len(updated_entries), len(updated_users))
+        
+        # Обновляем персональные файлы для каждой изменённой записи
+        # Также собираем информацию о personal_path для обновления в БД
+        updated_personal_paths = []  # Список (vk_id, personal_path) для обновления в БД
+        
+        for vk_id, groups, new_row in updated_entries:
+            # Ищем персональный файл для этой конкретной записи (по vk_id и groups)
+            matched_file = None
+            all_files_for_vk = []
+            
+            for file in os.listdir(users_dir):
                     if file.startswith(f"{vk_id}_") and file.endswith('.csv'):
-                        personal_files.append(file)
-                
-                if personal_files:
-                    # Берем самый новый файл (по времени создания)
-                    personal_files.sort(key=lambda x: os.path.getctime(os.path.join(users_dir, x)), reverse=True)
-                    personal_file = os.path.join(users_dir, personal_files[0])
-                    
-                    # Создаем новый персональный файл с обновленными данными
+                        file_path = os.path.join(users_dir, file)
+                        all_files_for_vk.append(file_path)
+                    # Проверяем содержимое файла чтобы найти нужную группу
+                    try:
+                        df = pd.read_csv(file_path, dtype=str)
+                        if not df.empty:
+                            file_groups = str(df.iloc[0].get('groups', '')).strip()
+                            if file_groups == groups:
+                                matched_file = file_path
+                                break
+                    except Exception:
+                        pass
+            
+            if not matched_file and all_files_for_vk:
+                # Если не нашли по группе, берём самый новый файл этого vk_id
+                all_files_for_vk.sort(key=lambda x: os.path.getctime(x), reverse=True)
+                matched_file = all_files_for_vk[0]
+                log.warning('Could not find personal file by groups=%s for vk_id=%s, using newest file', groups, vk_id)
+            
+            if matched_file:
                     new_personal_df = pd.DataFrame([new_row])
                     try:
-                        new_personal_df.to_csv(personal_file, index=False, encoding='utf-8')
-                        log.info('Updated personal file for vk_id=%s: %s', vk_id, personal_file)
-                    except Exception:
-                        log.exception('Failed to update personal file for vk_id=%s', vk_id)
+                        new_personal_df.to_csv(matched_file, index=False, encoding='utf-8')
+                        log.info('Updated personal file for vk_id=%s groups=%s: %s', vk_id, groups, matched_file)
+                        updated_personal_paths.append((vk_id, matched_file))
+                    except Exception as e:
+                        log.exception('Failed to update personal file for vk_id=%s groups=%s', vk_id, groups)
         
         # Заменяем основной CSV файл
         try:
@@ -1449,44 +2094,38 @@ def update_statement_data(statement_folder: str, target_filename: str, new_csv_p
             log.exception('Failed to replace main CSV file %s', old_csv_path)
             return False, []
         
-        # Обновляем записи в БД (обновляем personal_path и снимаем согласованность для пользователей с изменениями)
+        # Обновляем записи в БД - сбрасываем согласованность ТОЛЬКО для конкретных записей (по personal_path)
         try:
             conn = sqlite3.connect(DB_PATH, timeout=30)
             c = conn.cursor()
             
-            for vk_id in updated_users:
-                # Находим актуальный personal_path для этого пользователя
-                personal_files = []
-                for file in os.listdir(users_dir):
-                    if file.startswith(f"{vk_id}_") and file.endswith('.csv'):
-                        personal_files.append(file)
+            reset_count = 0
+            for vk_id, personal_path in updated_personal_paths:
+                # Сбрасываем статус только для записи с этим personal_path
+                c.execute('''UPDATE vedomosti_users 
+                             SET status = NULL, disagree_reason = NULL, confirmed_at = NULL 
+                             WHERE personal_path = ?''',
+                         (personal_path,))
+                affected = c.rowcount
+                log.info('Reset agreement status for personal_path=%s (affected rows: %d)', personal_path, affected)
                 
-                if personal_files:
-                    personal_files.sort(key=lambda x: os.path.getctime(os.path.join(users_dir, x)), reverse=True)
-                    new_personal_path = os.path.join(users_dir, personal_files[0])
-                    
-                    # Обновляем personal_path и снимаем согласованность (сбрасываем status, disagree_reason, confirmed_at)
+                # Если не нашли по personal_path, пробуем по vk_id + original_filename + LIKE personal_path
+                if affected == 0:
                     c.execute('''UPDATE vedomosti_users 
-                                 SET personal_path = ?, status = NULL, disagree_reason = NULL, confirmed_at = NULL 
-                                 WHERE vk_id = ? AND original_filename = ?''',
-                             (new_personal_path, vk_id, target_filename))
+                                 SET status = NULL, disagree_reason = NULL, confirmed_at = NULL 
+                                 WHERE vk_id = ? AND original_filename = ? AND personal_path LIKE ?''',
+                             (vk_id, target_filename, f'%{os.path.basename(personal_path)}%'))
                     affected = c.rowcount
-                    log.info('Reset agreement status for vk_id=%s in statement %s (affected rows: %d)', vk_id, target_filename, affected)
-                    
-                    # Если не нашлось по точному совпадению, пробуем без расширения
-                    if affected == 0:
-                        c.execute('''UPDATE vedomosti_users 
-                                     SET personal_path = ?, status = NULL, disagree_reason = NULL, confirmed_at = NULL 
-                                     WHERE vk_id = ? AND (original_filename = ? OR original_filename = ?)''',
-                                 (new_personal_path, vk_id, target_filename.replace('.csv', ''), target_filename))
-                        affected = c.rowcount
-                        log.info('Second attempt: Reset agreement status for vk_id=%s (affected rows: %d)', vk_id, affected)
+                    log.info('Second attempt: Reset for vk_id=%s path_like=%s (affected rows: %d)', vk_id, os.path.basename(personal_path), affected)
+                
+                if affected > 0:
+                    reset_count += affected
             
             conn.commit()
             conn.close()
-            log.info('Updated personal_path and reset agreement status in database for %d users', len(updated_users))
+            log.info('Reset agreement status in database for %d entries', reset_count)
         except Exception:
-            log.exception('Failed to update personal_path and reset agreement status in database')
+            log.exception('Failed to reset agreement status in database')
         
         return True, updated_users
         
@@ -1551,28 +2190,25 @@ def find_archived_statement(statement_name: str) -> tuple:
         return None, None
     
     # Очищаем название от возможных символов маркера списка
+    
+            # Ищем точное совпадение
+        # Очищаем название от возможных символов маркера списка
     statement_name = statement_name.strip().lstrip('•').strip()
+    # Убираем расширение .csv если оно есть
+    if statement_name.endswith('.csv'):
+        statement_name = statement_name[:-4]
     
-    # Ищем точное совпадение
+    # Ищем только точное совпадение (без учета расширения файла и регистра)
     for root, dirs, files in os.walk(archive_path):
         if 'users' in root:
             continue
         for file in files:
             if file.endswith('.csv'):
                 file_base = os.path.splitext(file)[0]
-                if file_base == statement_name or file == statement_name:
+                # Точное совпадение без учета регистра
+                if file_base.lower() == statement_name.lower():
                     return root, file
-    
-    # Если не нашли точное совпадение, ищем по частичному совпадению
-    for root, dirs, files in os.walk(archive_path):
-        if 'users' in root:
-            continue
-        for file in files:
-            if file.endswith('.csv'):
-                file_base = os.path.splitext(file)[0]
-                if statement_name.lower() in file_base.lower() or file_base.lower() in statement_name.lower():
-                    return root, file
-    
+
     return None, None
 
 
@@ -1584,7 +2220,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info('Ignoring /delete from non-admin %s', from_id)
         await msg.reply_text('Только админы могут удалять ведомости.')
         return
-    
+        
     # Получаем список ведомостей для удаления
     if not context.args and not msg.text:
         await msg.reply_text(
@@ -1629,20 +2265,18 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not statement_names:
         await msg.reply_text('Не указаны ведомости для удаления.')
         return
-    
-    # Удаляем дубликаты, сохраняя порядок, и фильтруем пустые значения
     statement_names = [name for name in dict.fromkeys(statement_names) if name and name.strip()]
-    
+
     total_to_delete = len(statement_names)
     await msg.reply_text(f'Начинаю удаление {total_to_delete} архивных ведомостей...')
-    
+
     archive_path = os.path.join(HOSTING_ROOT, ARCHIVE_DIRNAME)
     results = {
         'success': [],
         'not_found': [],
         'errors': []
     }
-    
+
     try:
         for statement_name in statement_names:
             statement_folder, target_filename = find_archived_statement(statement_name)
@@ -1654,29 +2288,31 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 # Подсчитываем количество пользователей в БД
-                users_count = count_users_in_statement(target_filename)
+                users_count = count_users_in_statement(target_filename)  # подсчитываем количество пользователей в БД
                 
                 # Удаляем папку с ведомостью
                 shutil.rmtree(statement_folder)
                 log.info('Deleted archived statement folder: %s', statement_folder)
-                
-                # Удаляем записи из БД
+            
+            # Удаляем записи из БД
                 removed_count = remove_users_from_statement(target_filename)
                 
                 results['success'].append({
-                    'name': statement_name,
-                    'filename': target_filename,
-                    'folder': statement_folder,
-                    'users_count': users_count,
-                    'removed_count': removed_count
-                })
-                
+                            'name': statement_name,
+                            'filename': target_filename,
+                            'folder': statement_folder,
+                            'users_count': users_count,
+                            'removed_count': removed_count
+                        })
+                    
             except Exception as e:
                 log.exception('Failed to delete archived statement %s: %s', statement_name, e)
                 results['errors'].append({
                     'name': statement_name,
                     'error': str(e)
-                })
+            })
+    # Удаляем дубликаты, сохраняя порядок, и фильтруем пустые значения
+
         
         # Формируем итоговый отчет
         report_lines = [f'Удаление завершено. Обработано: {total_to_delete} ведомостей\n']
@@ -1785,6 +2421,126 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception('Error in update command')
         await msg.reply_text(f'Ошибка при обновлении: {str(e)}')
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для поиска ведомостей по VK ID: /find https://vk.com/id160898445"""
+    msg = update.message
+    from_id = msg.from_user.id
+    if not is_admin(from_id):
+        log.info('Ignoring /find from non-admin %s', from_id)
+        await msg.reply_text('Только админы могут использовать эту команду.')
+        return
+
+    # Получаем аргумент (URL или VK ID)
+    if not context.args:
+        await msg.reply_text(
+            'Укажите VK ID или ссылку на профиль.\n'
+            'Использование: /find https://vk.com/id160898445\n'
+            'Или: /find 160898445\n\n'
+            'Команда выведет все ведомости пользователя с их статусами согласования.'
+        )
+        return
+    
+    # Парсим VK ID из аргумента
+    vk_id_arg = ' '.join(context.args).strip()
+    vk_id = None
+    
+    # Пробуем извлечь ID из URL
+    url_patterns = [
+        r'https?://vk\.com/id(\d+)',
+        r'https?://vk\.com/(\d+)',
+        r'vk\.com/id(\d+)',
+        r'vk\.com/(\d+)',
+    ]
+    
+    for pattern in url_patterns:
+        match = re.search(pattern, vk_id_arg)
+        if match:
+            vk_id = match.group(1)
+            break
+    
+    # Если не нашли в URL, пробуем как прямой ID
+    if not vk_id:
+        if vk_id_arg.isdigit():
+            vk_id = vk_id_arg
+        else:
+            await msg.reply_text(
+                f'Не удалось извлечь VK ID из "{vk_id_arg}".\n'
+                'Использование: /find https://vk.com/id160898445\n'
+                'Или: /find 160898445'
+            )
+            return
+    
+    try:
+        # Получаем все ведомости пользователя из БД
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        c = conn.cursor()
+        c.execute("""
+            SELECT original_filename, status, created_at
+            FROM vedomosti_users 
+            WHERE vk_id = ? AND state LIKE 'imported:%'
+            ORDER BY created_at DESC, id DESC
+        """, (str(vk_id),))
+        rows = c.fetchall()
+        conn.close()
+        
+        if not rows:
+            await msg.reply_text(f'Ведомости для пользователя VK ID {vk_id} не найдены.')
+            return
+        
+        # Форматируем результат
+        result_lines = [f'Ведомости для пользователя VK ID: {vk_id}\n']
+        result_lines.append(f'Всего ведомостей: {len(rows)}\n')
+        result_lines.append('─' * 40)
+        
+        for idx, (original_filename, status, created_at) in enumerate(rows, 1):
+            # Убираем расширение .csv из названия
+            filename_display = original_filename.replace('.csv', '') if original_filename else 'Без названия'
+            
+            # Определяем статус согласования
+            if status == 'agreed':
+                status_text = ' Согласовано'
+            elif status == 'disagreed':
+                status_text = ' Не согласовано'
+            elif status:
+                status_text = f' {status}'
+            else:
+                status_text = ' Ожидает согласования'
+            
+            result_lines.append(f'\n{idx}. {filename_display}')
+            result_lines.append(f'   Статус: {status_text}')
+        
+        result_text = '\n'.join(result_lines)
+        
+        # Разбиваем на части, если сообщение слишком длинное
+        max_length = 4000  # Лимит Telegram
+        if len(result_text) > max_length:
+            # Отправляем первую часть
+            first_part = result_text[:max_length]
+            last_newline = first_part.rfind('\n')
+            if last_newline > 0:
+                first_part = first_part[:last_newline]
+            await msg.reply_text(first_part)
+            
+            # Отправляем оставшуюся часть
+            remaining = result_text[last_newline+1:]
+            while len(remaining) > max_length:
+                chunk = remaining[:max_length]
+                last_newline = chunk.rfind('\n')
+                if last_newline > 0:
+                    chunk = chunk[:last_newline]
+                await msg.reply_text(chunk)
+                remaining = remaining[len(chunk)+1:]
+            if remaining:
+                await msg.reply_text(remaining)
+        else:
+            await msg.reply_text(result_text)
+            
+        log.info('Find command executed by %s for VK ID %s, found %d statements', from_id, vk_id, len(rows))
+        
+    except Exception as e:
+        log.exception('Error in find command')
+        await msg.reply_text(f'Ошибка при поиске: {str(e)}')
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Неизвестная команда. Используйте /start, пришлите файл или /send <предмет> <тип курса> <блок>.')
@@ -2016,9 +2772,12 @@ def run_bot():
             BotCommand('start', 'Знакомство'),
             BotCommand('description', 'Показать описание процесса загрузки'),
             BotCommand('send', 'Отправить файл на хостинг: /send <предмет> <тип курса> <блок>'),
+            BotCommand('send_repet', 'Отправить файл репетиторов: /send_repet <предмет> <тип курса> <блок>'),
             BotCommand('update', 'Обновить ведомость: /update <название ведомости>'),
             BotCommand('notify', 'Разослать уведомление vk_id из БД'),
+            BotCommand('notify_repet', 'Разослать уведомление репетиторам (VK из столбца ВК)'),
             BotCommand('liststatements', 'Показать список открытых и архивных ведомостей'),
+            BotCommand('find', 'Поиск ведомостей по VK ID: /find https://vk.com/id160898445'),
             BotCommand('addadmin', 'Добавить админа: /addadmin <username_or_id>'),
             BotCommand('deladmin', 'Удалить админа: /deladmin <username_or_id>'),
             BotCommand('listadmins', 'Показать список текущих админов'),
@@ -2033,9 +2792,13 @@ def run_bot():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('description', description))
     application.add_handler(CommandHandler('send', send_command))
+    application.add_handler(CommandHandler('send_repet', send_repet_command))
     application.add_handler(CommandHandler('update', update_command))
     application.add_handler(CommandHandler('notify', notify_command))
+    application.add_handler(CommandHandler('notify_repet', notify_repet_command))
+    application.add_handler(CommandHandler('send_keyboard', send_keyboard_command))
     application.add_handler(CommandHandler('liststatements', liststatements_command))
+    application.add_handler(CommandHandler('find', find_command))
     application.add_handler(CommandHandler('addadmin', addadmin_command))
     application.add_handler(CommandHandler('deladmin', deladmin_command))
     application.add_handler(CommandHandler('listadmins', listadmins_command))
